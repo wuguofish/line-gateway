@@ -1,0 +1,11 @@
+node_modules/
+bun.lock
+*.log
+daemon.out.log
+daemon.err.log
+
+# Runtime state
+*.db
+*.db-wal
+*.db-shm
+.state
