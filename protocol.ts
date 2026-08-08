@@ -109,6 +109,14 @@ export interface InboundFrame {
     quoted_type?: string
     quoted_text?: string
     /**
+     * Present when the quoted message was part of a multi-image "album"
+     * share (LINE imageSet) — lets the recipient know there are more
+     * images than the one being quoted, retrievable via get_content on
+     * any member of the set.
+     */
+    quoted_image_set_index?: number
+    quoted_image_set_total?: number
+    /**
      * Sender's LINE displayName, resolved server-side via the gateway's
      * DisplayNameCache (TTL'd). Empty on first-ever sighting of a
      * userId; populated from the second message onward once the cache
@@ -148,6 +156,24 @@ export interface ApiResponseFrame {
   error?: string
 }
 
+/**
+ * Sent right after a successful `claim` when the claiming session was
+ * previously the handler and its connection had been down long enough
+ * that inbound delivery was suspended (see HandlerManager.isHandler).
+ * Anything archived during that window was persisted but never pushed —
+ * this tells the reconnecting session so it can `fetch_messages` instead
+ * of silently missing a backlog.
+ */
+export interface CatchupNoticeFrame {
+  type: 'catchup_notice'
+  /** Taipei-offset ISO timestamp marking the start of the missed window. */
+  since: string
+  /** Wall-clock duration of the disconnect gap, in ms. */
+  gap_ms: number
+  /** Count of archived messages received during the gap. */
+  count: number
+}
+
 export type GatewayToPlugin =
   | HelloAckFrame
   | ClaimAckFrame
@@ -156,6 +182,7 @@ export type GatewayToPlugin =
   | PongFrame
   | HandlerLostFrame
   | ApiResponseFrame
+  | CatchupNoticeFrame
 
 // --- Type guards ------------------------------------------------------------
 

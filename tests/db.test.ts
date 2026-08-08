@@ -1,8 +1,12 @@
 import { test, expect, describe, beforeEach } from 'bun:test'
-import type { Database } from 'bun:sqlite'
+import { Database } from 'bun:sqlite'
+import { unlinkSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import {
   openDatabase, insertMessage, fetchMessages,
-  recentChatIds, countMessages, extractChatId,
+  recentChatIds, countMessages, extractChatId, getQuoteToken,
+  getImageSetMessages,
   type InboundMessageEvent,
 } from '../db'
 
@@ -116,5 +120,149 @@ describe('insertMessage + fetchMessages', () => {
     insertMessage(db, ev, '2026-04-17T10:00:00.000+08:00')
     const rows = fetchMessages(db)
     expect(JSON.parse(rows[0]!.raw_json)).toEqual(ev as any)
+  })
+})
+
+describe('imageSet columns + getImageSetMessages', () => {
+  let db: Database
+  beforeEach(() => { db = openDatabase(':memory:') })
+
+  function makeImage(id: string, setId: string, index: number, total: number): InboundMessageEvent {
+    return {
+      type: 'message',
+      source: { type: 'group', userId: 'U1', groupId: 'C1' },
+      message: { id, type: 'image', imageSet: { id: setId, index, total } } as any,
+    }
+  }
+
+  test('insertMessage persists image_set_id/index/total', () => {
+    insertMessage(db, makeImage('m1', 'SET-A', 1, 3), '2026-07-18T21:18:13.000+08:00')
+    const rows = fetchMessages(db)
+    expect(rows[0]!.image_set_id).toBe('SET-A')
+    expect(rows[0]!.image_set_index).toBe(1)
+    expect(rows[0]!.image_set_total).toBe(3)
+  })
+
+  test('non-imageSet messages leave the columns null', () => {
+    insertMessage(db, makeEvent({ id: 'm1' }), '2026-07-18T10:00:00.000+08:00')
+    const rows = fetchMessages(db)
+    expect(rows[0]!.image_set_id).toBeNull()
+    expect(rows[0]!.image_set_index).toBeNull()
+    expect(rows[0]!.image_set_total).toBeNull()
+  })
+
+  test('getImageSetMessages returns the whole set ordered by index, ignoring other sets', () => {
+    insertMessage(db, makeImage('m3', 'SET-A', 3, 3), '2026-07-18T21:18:14.394+08:00')
+    insertMessage(db, makeImage('m1', 'SET-A', 1, 3), '2026-07-18T21:18:13.561+08:00')
+    insertMessage(db, makeImage('m2', 'SET-A', 2, 3), '2026-07-18T21:18:13.762+08:00')
+    insertMessage(db, makeImage('other', 'SET-B', 1, 1), '2026-07-18T21:19:00.000+08:00')
+    const set = getImageSetMessages(db, 'SET-A')
+    expect(set.map(r => r.id)).toEqual(['m1', 'm2', 'm3'])
+  })
+
+  test('getImageSetMessages returns empty array for an unknown set id', () => {
+    expect(getImageSetMessages(db, 'NOPE')).toEqual([])
+  })
+
+  test('opening a pre-existing database created before image_set columns existed migrates cleanly', () => {
+    // Simulate a database from before this schema change: same messages
+    // table but WITHOUT the three new columns, populated with one row.
+    const path = join(tmpdir(), 'line-gateway-test-migration.db')
+    try { unlinkSync(path) } catch {}
+    const oldDb = new Database(path)
+    oldDb.exec(`
+      CREATE TABLE messages (
+        id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, sender_user_id TEXT,
+        message_type TEXT NOT NULL, text TEXT, line_ts INTEGER,
+        received_at TEXT NOT NULL, raw_json TEXT NOT NULL
+      )
+    `)
+    oldDb.query(`INSERT INTO messages (id, chat_id, message_type, received_at, raw_json) VALUES (?, ?, ?, ?, ?)`)
+      .run('pre-existing', 'C1', 'text', '2026-07-01T00:00:00.000+08:00', '{}')
+    oldDb.close()
+
+    // Re-opening via openDatabase() must not throw, must add the columns,
+    // and must leave the pre-existing row intact.
+    const migrated = openDatabase(path)
+    const rows = fetchMessages(migrated)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.id).toBe('pre-existing')
+    expect(rows[0]!.image_set_id).toBeNull()
+    migrated.close()
+
+    // A second open (idempotency — ensureColumn must not re-ALTER and throw).
+    let reopened: Database | undefined
+    expect(() => { reopened = openDatabase(path) }).not.toThrow()
+    reopened?.close()
+
+    try { unlinkSync(path) } catch {}
+  })
+
+  test('reopening backfills image_set columns for image rows archived before the migration', () => {
+    // Simulate a pre-migration database: old-shape table, one image row
+    // whose raw_json carries imageSet data that predates the columns.
+    const path = join(tmpdir(), 'line-gateway-test-backfill.db')
+    try { unlinkSync(path) } catch {}
+    const oldDb = new Database(path)
+    oldDb.exec(`
+      CREATE TABLE messages (
+        id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, sender_user_id TEXT,
+        message_type TEXT NOT NULL, text TEXT, line_ts INTEGER,
+        received_at TEXT NOT NULL, raw_json TEXT NOT NULL
+      )
+    `)
+    const rawEvent = JSON.stringify({
+      type: 'message',
+      source: { type: 'group', groupId: 'C1', userId: 'U1' },
+      message: { id: 'old-img-1', type: 'image', imageSet: { id: 'SET-OLD', index: 2, total: 3 } },
+    })
+    oldDb.query(`INSERT INTO messages (id, chat_id, sender_user_id, message_type, received_at, raw_json) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run('old-img-1', 'C1', 'U1', 'image', '2026-07-18T21:18:13.000+08:00', rawEvent)
+    // A non-image row and a malformed-json image row should be left alone,
+    // not crash the backfill.
+    oldDb.query(`INSERT INTO messages (id, chat_id, sender_user_id, message_type, received_at, raw_json) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run('old-text-1', 'C1', 'U1', 'text', '2026-07-18T21:18:00.000+08:00', '{}')
+    oldDb.query(`INSERT INTO messages (id, chat_id, sender_user_id, message_type, received_at, raw_json) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run('old-img-bad', 'C1', 'U1', 'image', '2026-07-18T21:18:20.000+08:00', 'not json')
+    oldDb.close()
+
+    const migrated = openDatabase(path)
+    const set = getImageSetMessages(migrated, 'SET-OLD')
+    expect(set).toHaveLength(1)
+    expect(set[0]!.id).toBe('old-img-1')
+    expect(set[0]!.image_set_index).toBe(2)
+    expect(set[0]!.image_set_total).toBe(3)
+
+    // Re-opening again must not re-touch (or throw on) the already-backfilled
+    // row or the malformed one.
+    migrated.close()
+    let reopened: Database | undefined
+    expect(() => { reopened = openDatabase(path) }).not.toThrow()
+    reopened?.close()
+
+    try { unlinkSync(path) } catch {}
+  })
+})
+
+describe('getQuoteToken', () => {
+  let db: Database
+  beforeEach(() => { db = openDatabase(':memory:') })
+
+  test('resolves message_id to the archived quoteToken', () => {
+    insertMessage(db, {
+      type: 'message',
+      source: { type: 'user', userId: 'U1' },
+      message: { id: 'm1', type: 'text', text: 'hi', quoteToken: 'qtok-xyz' } as any,
+    }, '2026-04-17T10:00:00.000+08:00')
+    expect(getQuoteToken(db, 'm1')).toBe('qtok-xyz')
+  })
+
+  test('returns null when message_id is not archived', () => {
+    expect(getQuoteToken(db, 'missing')).toBeNull()
+  })
+
+  test('returns null when the archived message has no quoteToken', () => {
+    insertMessage(db, makeEvent({ id: 'm1' }), '2026-04-17T10:00:00.000+08:00')
+    expect(getQuoteToken(db, 'm1')).toBeNull()
   })
 })

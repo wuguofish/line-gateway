@@ -172,6 +172,64 @@ describe('GatewayClient', () => {
     c.stop()
   })
 
+  test('catchup_notice fires onCatchupNotice callback', () => {
+    const seen: any[] = []
+    const c = new GatewayClient({
+      log: () => {},
+      url: 'ws://x', cc_session_id: 'cc-1', pid: 42, plugin_version: '0.1',
+      onCatchupNotice: (n) => seen.push(n),
+      wsFactory: factoryHolder.factory,
+    })
+    c.start()
+    factoryHolder.latest().open()
+    factoryHolder.latest().messageJson({ type: 'catchup_notice', since: '2026-07-18T18:38:00.000+08:00', gap_ms: 125_000, count: 11 })
+    expect(seen).toEqual([{ since: '2026-07-18T18:38:00.000+08:00', gap_ms: 125_000, count: 11 }])
+    c.stop()
+  })
+
+  test('claimOnConnect losing the race fires onAutoClaimFailed', () => {
+    const seen: any[] = []
+    const c = new GatewayClient({
+      log: () => {},
+      url: 'ws://x', cc_session_id: 'cc-1', pid: 42, plugin_version: '0.1',
+      claimOnConnect: true,
+      onAutoClaimFailed: (info) => seen.push(info),
+      wsFactory: factoryHolder.factory,
+    })
+    c.start()
+    factoryHolder.latest().open()
+    // No pendingClaim exists — claimOnConnect's claim() is fire-and-forget —
+    // so this ack must be routed to onAutoClaimFailed, not silently dropped.
+    factoryHolder.latest().messageJson({
+      type: 'claim_ack', ok: false,
+      reason: 'handler is currently cc-other — pass force:true to take over',
+      previous_handler: 'cc-other',
+    })
+    expect(seen).toEqual([{ reason: 'handler is currently cc-other — pass force:true to take over', previous_handler: 'cc-other' }])
+    expect(c.handler()).toBe(false)
+    c.stop()
+  })
+
+  test('a successful claimWithAck does not spuriously fire onAutoClaimFailed', async () => {
+    const seen: any[] = []
+    const c = new GatewayClient({
+      log: () => {},
+      url: 'ws://x', cc_session_id: 'cc-1', pid: 42, plugin_version: '0.1',
+      onAutoClaimFailed: (info) => seen.push(info),
+      wsFactory: factoryHolder.factory,
+    })
+    c.start()
+    const ws = factoryHolder.latest()
+    ws.open()
+    const p = c.claimWithAck(false)
+    ws.messageJson({ type: 'claim_ack', ok: false, reason: 'busy', previous_handler: 'cc-other' })
+    await p
+    // This ack had a pendingClaim (explicit claimWithAck) — it must resolve
+    // that promise, not the auto-claim-failed path.
+    expect(seen).toEqual([])
+    c.stop()
+  })
+
   test('handler_lost clears handler flag and fires callback', () => {
     const seen: any[] = []
     const c = new GatewayClient({

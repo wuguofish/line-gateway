@@ -1,5 +1,5 @@
 import { test, expect, describe } from 'bun:test'
-import { formatInbound, formatPermissionBody } from '../plugin-inbound'
+import { formatInbound, formatPermissionBody, formatCatchupNotice, formatAutoClaimFailedNotice } from '../plugin-inbound'
 
 describe('formatInbound', () => {
   test('returns null for non-message events', () => {
@@ -111,6 +111,68 @@ describe('formatInbound', () => {
     expect(n!.meta.quoted_message_id).toBe('m0')
     expect(n!.meta.quoted_text).toBeUndefined()
     expect(n!.meta.quoted_user).toBeUndefined()
+  })
+
+  test('enrichment with quoted_image_set_total surfaces the set size in meta as a string', () => {
+    const n = formatInbound({
+      type: 'message',
+      source: { type: 'group', userId: 'U1', groupId: 'C1' },
+      message: { id: 'm1', type: 'text', text: '阿宇！這邊！', quotedMessageId: 'm0' },
+    }, {
+      enrichment: {
+        quoted_message_id: 'm0', quoted_type: 'image',
+        quoted_image_set_index: 1, quoted_image_set_total: 3,
+      },
+    })
+    expect(n!.meta.quoted_image_set).toBe('1/3')
+  })
+
+  test('quoted_image_set_total without an index still renders a string', () => {
+    const n = formatInbound({
+      type: 'message',
+      source: { type: 'group', userId: 'U1', groupId: 'C1' },
+      message: { id: 'm1', type: 'text', text: '阿宇', quotedMessageId: 'm0' },
+    }, {
+      enrichment: { quoted_message_id: 'm0', quoted_type: 'image', quoted_image_set_total: 4 },
+    })
+    expect(n!.meta.quoted_image_set).toBe('?/4')
+  })
+
+  test('enrichment without quoted_image_set_total leaves the field unset', () => {
+    const n = formatInbound({
+      type: 'message',
+      source: { type: 'user', userId: 'U1' },
+      message: { id: 'm1', type: 'text', text: 'ok', quotedMessageId: 'm0' },
+    }, {
+      enrichment: { quoted_message_id: 'm0', quoted_type: 'text' },
+    })
+    expect(n!.meta.quoted_image_set).toBeUndefined()
+  })
+
+  // Regression guard for the 2026-07-27 silent-drop bug: Claude Code's channel
+  // host lifts meta keys into XML attributes and discards the entire
+  // notification when a value isn't a string — with no error back to the
+  // plugin. Shipping quoted_image_set_index/total as numbers (2026-07-18)
+  // swallowed every quote-reply to a multi-image album for nine days.
+  test('every populated meta value is a string, whatever the enrichment', () => {
+    const n = formatInbound({
+      type: 'message',
+      source: { type: 'group', userId: 'U1', groupId: 'C1' },
+      message: {
+        id: 'm1', type: 'text', text: '阿宇你看',
+        quotedMessageId: 'm0', quoteToken: 'tok1',
+      },
+    }, {
+      enrichment: {
+        quoted_message_id: 'm0', quoted_user: 'U2', quoted_ts: '2026-07-27T09:30:16.000+08:00',
+        quoted_type: 'image', quoted_text: '[image]', user_name: '軒寶',
+        quoted_image_set_index: 2, quoted_image_set_total: 5,
+      },
+    })
+    const offenders = Object.entries(n!.meta)
+      .filter(([, v]) => v !== undefined && typeof v !== 'string')
+      .map(([k, v]) => `${k}=${typeof v}`)
+    expect(offenders).toEqual([])
   })
 
   test('message with quotedMessageId but no enrichment leaves meta quoted_* empty', () => {
@@ -252,6 +314,40 @@ describe('formatPermissionBody', () => {
     expect(body.length).toBeLessThanOrEqual(5000)
     expect(body).toContain('…')
     expect(body).toContain('y abcde')  // footer preserved
+  })
+})
+
+describe('formatCatchupNotice', () => {
+  test('surfaces gap duration, count, and a fetch_messages instruction', () => {
+    const n = formatCatchupNotice({ since: '2026-07-18T18:38:00.000+08:00', gap_ms: 125_000, count: 11 })
+    expect(n.content).toContain('~125s')
+    expect(n.content).toContain('11 message(s)')
+    expect(n.content).toContain('fetch_messages(since: "2026-07-18T18:38:00.000+08:00")')
+    expect(n.content).toContain('do not reply')
+  })
+
+  test('uses a synthetic chat_id that is clearly not a real LINE id', () => {
+    const n = formatCatchupNotice({ since: '2026-07-18T18:38:00.000+08:00', gap_ms: 1000, count: 1 })
+    expect(n.meta.chat_id).toBe('__gateway_system__')
+    expect(n.meta.source_type).toBe('user')
+  })
+})
+
+describe('formatAutoClaimFailedNotice', () => {
+  test('names the current holder and instructs claim_handler(force:true)', () => {
+    const n = formatAutoClaimFailedNotice(
+      { reason: 'handler is currently cc-other — pass force:true to take over', previous_handler: 'cc-other' },
+      { now: () => new Date('2026-07-18T18:41:00.000Z') },
+    )
+    expect(n.content).toContain('session "cc-other"')
+    expect(n.content).toContain('claim_handler(force: true)')
+    expect(n.content).toContain('do not reply')
+    expect(n.meta.chat_id).toBe('__gateway_system__')
+  })
+
+  test('falls back to generic phrasing when previous_handler is null', () => {
+    const n = formatAutoClaimFailedNotice({ previous_handler: null })
+    expect(n.content).toContain('another session')
   })
 })
 

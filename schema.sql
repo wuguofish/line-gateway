@@ -16,8 +16,14 @@ CREATE TABLE IF NOT EXISTS messages (
     text            TEXT,                    -- body for text messages, null otherwise
     line_ts         INTEGER,                 -- LINE event.timestamp (ms epoch)
     received_at     TEXT NOT NULL,           -- ISO-8601 +08:00 when gateway processed it
-    raw_json        TEXT NOT NULL            -- full event JSON for future decoding
+    raw_json        TEXT NOT NULL,           -- full event JSON for future decoding
+    image_set_id    TEXT,                    -- message.imageSet.id when sent as a multi-image album
+    image_set_index INTEGER,                 -- 1-based position within the set
+    image_set_total INTEGER                  -- total images in the set
 );
+-- image_set_id/index/total on a fresh table are covered by the CREATE
+-- above; db.ts additionally runs an idempotent ALTER TABLE migration for
+-- databases created before these columns existed (see ensureColumn()).
 
 -- Serves fetch_messages(chat_id, limit) ORDER BY received_at DESC
 CREATE INDEX IF NOT EXISTS idx_messages_chat_time
@@ -26,3 +32,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_time
 -- Serves "recent inbound chats" lookups (known chat_id gate for send_image)
 CREATE INDEX IF NOT EXISTS idx_messages_received_at
     ON messages(received_at DESC);
+
+-- idx_messages_image_set is created in db.ts's openDatabase(), AFTER the
+-- ensureColumn() migration runs — not here, because on a pre-existing
+-- database (created before image_set_id existed) this file runs before
+-- the column has been added, and CREATE INDEX on a missing column fails.

@@ -222,6 +222,13 @@ function buildEnrichment(
         if (row.received_at)    enr.quoted_ts   = row.received_at
         enr.quoted_type = row.message_type
         enr.quoted_text = renderQuotedPreview(row.message_type, row.text, row.raw_json)
+        // Quoting one image of a multi-image "album" share is easy to miss
+        // that there were more — surface the set size so the model knows
+        // to pull the rest via get_content(message_id) on any member.
+        if (row.image_set_id && row.image_set_total) {
+          enr.quoted_image_set_index = row.image_set_index ?? undefined
+          enr.quoted_image_set_total = row.image_set_total
+        }
       }
     }
   }
