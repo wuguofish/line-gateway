@@ -34,6 +34,22 @@ export interface ChannelMeta {
   quoted_ts?: string
   quoted_type?: string
   quoted_text?: string
+  /**
+   * Present when the quoted message was one image of a multi-image LINE
+   * "album" share, rendered as `"<index>/<total>"` (e.g. `"2/5"`) — a total
+   * above 1 is the signal there are more images than this one to look at.
+   * Call get_content(message_id) with quoted_message_id (or any other
+   * member's id) to retrieve the whole set in one call.
+   *
+   * MUST stay a string. Claude Code's channel host lifts every meta key
+   * into the `<channel>` tag's XML attributes, and a non-string value makes
+   * it drop the whole notification silently — no error back to the plugin,
+   * the message simply never reaches the model. Shipping this pair as
+   * numbers (2026-07-18) swallowed every quote-reply to an album member
+   * until 2026-07-27; every other meta field is a string for the same
+   * reason. Don't add a numeric one.
+   */
+  quoted_image_set?: string
 }
 
 export interface ChannelNotification {
@@ -161,9 +177,69 @@ export function formatInbound(
     if (enr.quoted_ts)   meta.quoted_ts   = enr.quoted_ts
     if (enr.quoted_type) meta.quoted_type = enr.quoted_type
     if (typeof enr.quoted_text === 'string') meta.quoted_text = enr.quoted_text
+    // Rendered as a string on purpose — see ChannelMeta.quoted_image_set.
+    if (typeof enr.quoted_image_set_total === 'number') {
+      meta.quoted_image_set = typeof enr.quoted_image_set_index === 'number'
+        ? enr.quoted_image_set_index + '/' + enr.quoted_image_set_total
+        : '?/' + enr.quoted_image_set_total
+    }
   }
 
   return { content, meta }
+}
+
+/**
+ * Format a gateway catch-up notice (see CatchupNoticeFrame) as a channel
+ * notification. Reuses the same `notifications/claude/channel` method the
+ * host actually surfaces to the model (there is no separate "system"
+ * notification capability registered) — so the content itself has to make
+ * clear this isn't a real chat message: a synthetic chat_id/user that
+ * can't be replied to by mistake, plus explicit instructions in the text.
+ */
+export function formatCatchupNotice(notice: { since: string; gap_ms: number; count: number }): ChannelNotification {
+  const seconds = Math.round(notice.gap_ms / 1000)
+  return {
+    content:
+      '[GATEWAY] Your connection to LINE was down for ~' + seconds + 's (since ' + notice.since + '). ' +
+      notice.count + ' message(s) arrived during that window and were archived but never pushed to you — ' +
+      'call fetch_messages(since: "' + notice.since + '") to review them. This is a system notice, not a chat message; do not reply to it.',
+    meta: {
+      chat_id: '__gateway_system__',
+      message_id: 'catchup-' + notice.since,
+      user: 'gateway',
+      ts: notice.since,
+      source_type: 'user',
+    },
+  }
+}
+
+/**
+ * Format the "lost the automatic handler-claim race" system notice (see
+ * GatewayClient's onAutoClaimFailed). Same reasoning as
+ * formatCatchupNotice on why this rides `notifications/claude/channel`
+ * with a synthetic sender instead of a dedicated method.
+ */
+export function formatAutoClaimFailedNotice(
+  info: { reason?: string; previous_handler: string | null },
+  deps: { now?: () => Date } = {},
+): ChannelNotification {
+  const ts = toTaipeiISOString(deps.now ? deps.now() : new Date())
+  const holder = info.previous_handler ? `session "${info.previous_handler}"` : 'another session'
+  return {
+    content:
+      '[GATEWAY] You reconnected to line-gateway but did NOT become the LINE handler — ' +
+      holder + ' currently holds the seat' + (info.reason ? ` (${info.reason})` : '') + '. ' +
+      'You will not receive inbound LINE messages until you claim it. If you are the intended ' +
+      'operator right now, call claim_handler(force: true) to take over. If another duty session ' +
+      'legitimately owns it, no action needed. This is a system notice, not a chat message; do not reply to it.',
+    meta: {
+      chat_id: '__gateway_system__',
+      message_id: 'autoclaim-failed-' + ts,
+      user: 'gateway',
+      ts,
+      source_type: 'user',
+    },
+  }
 }
 
 /**

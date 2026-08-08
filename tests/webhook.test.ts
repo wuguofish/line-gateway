@@ -435,6 +435,61 @@ test('dispatch reports quoted_absent_from_archive=false when the quoted id IS in
   expect(frame.enrichment.quoted_absent_from_archive).toBe(false)
 })
 
+test('dispatch surfaces quoted_image_set_index/total when quoting one image of an album', () => {
+  const s = setup(null)
+  const m = mockWs()
+  s.registry.add(m.ws, mkConnData('cc-handler'))
+  s.handlers.claim('cc-handler', false)
+  const db = openDatabase(':memory:')
+  insertMessage(db, {
+    type: 'message',
+    timestamp: 1_700_000_000_000,
+    source: { type: 'group', userId: 'Ulinbao', groupId: 'Cgroup' },
+    message: { id: 'img-1', type: 'image', imageSet: { id: 'SET-A', index: 1, total: 3 } } as any,
+  }, '2026-07-18T21:18:13.561+08:00')
+  const deps = { ...s.deps, db }
+
+  const payload = {
+    events: [{
+      type: 'message',
+      source: { type: 'group', userId: 'Ulinbao', groupId: 'Cgroup' },
+      message: { id: 'text-1', type: 'text', text: '阿宇！這邊！', quotedMessageId: 'img-1' },
+    }],
+  }
+  dispatch(payload, deps)
+  const frame = JSON.parse(m.sent[0]!)
+  expect(frame.enrichment.quoted_type).toBe('image')
+  expect(frame.enrichment.quoted_image_set_index).toBe(1)
+  expect(frame.enrichment.quoted_image_set_total).toBe(3)
+})
+
+test('dispatch omits quoted_image_set_* when the quoted image is not part of a set', () => {
+  const s = setup(null)
+  const m = mockWs()
+  s.registry.add(m.ws, mkConnData('cc-handler'))
+  s.handlers.claim('cc-handler', false)
+  const db = openDatabase(':memory:')
+  insertMessage(db, {
+    type: 'message',
+    timestamp: 1_700_000_000_000,
+    source: { type: 'user', userId: 'Uuser' },
+    message: { id: 'img-solo', type: 'image' },
+  }, '2026-07-18T21:00:00.000+08:00')
+  const deps = { ...s.deps, db }
+
+  const payload = {
+    events: [{
+      type: 'message',
+      source: { type: 'user', userId: 'Uuser' },
+      message: { id: 'text-1', type: 'text', text: '好看', quotedMessageId: 'img-solo' },
+    }],
+  }
+  dispatch(payload, deps)
+  const frame = JSON.parse(m.sent[0]!)
+  expect(frame.enrichment.quoted_image_set_index).toBeUndefined()
+  expect(frame.enrichment.quoted_image_set_total).toBeUndefined()
+})
+
 test('dispatch omits enrichment when message has no quotedMessageId', () => {
   const s = setup(null)
   const m = mockWs()

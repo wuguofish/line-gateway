@@ -58,6 +58,21 @@ export interface GatewayClientOptions {
   onPermissionReply?: (p: { request_id: string; behavior: 'allow' | 'deny' }) => void
   /** Fired when gateway kicks us out of the handler seat. */
   onHandlerLost?: (displaced_by: string | null) => void
+  /**
+   * Fired when a reclaim after a meaningful disconnect gap reveals a
+   * backlog of archived-but-undelivered messages (see CatchupNoticeFrame).
+   */
+  onCatchupNotice?: (notice: { since: string; gap_ms: number; count: number }) => void
+  /**
+   * Fired when the automatic claimOnConnect attempt loses the race for
+   * the handler seat. This is the ONLY caller of the fire-and-forget
+   * `claim()` method (explicit tool calls go through `claimWithAck`,
+   * which resolves its own promise instead), so any claim_ack that
+   * arrives with no pending claimWithAck is, by construction, this
+   * outcome. Without this hook a losing session has zero visibility —
+   * it silently never becomes handler and never learns why.
+   */
+  onAutoClaimFailed?: (info: { reason?: string; previous_handler: string | null }) => void
   /** Plain log sink (stderr by default). */
   log?: (msg: string) => void
 }
@@ -84,11 +99,13 @@ interface PendingClaim {
 export class GatewayClient {
   private ws: WsLike | null = null
   private readonly opts: Required<Omit<GatewayClientOptions,
-    'onInbound' | 'onPermissionReply' | 'onHandlerLost' | 'log' | 'wsFactory'
+    'onInbound' | 'onPermissionReply' | 'onHandlerLost' | 'onCatchupNotice' | 'onAutoClaimFailed' | 'log' | 'wsFactory'
   >> & {
     onInbound?: GatewayClientOptions['onInbound']
     onPermissionReply?: GatewayClientOptions['onPermissionReply']
     onHandlerLost?: GatewayClientOptions['onHandlerLost']
+    onCatchupNotice?: GatewayClientOptions['onCatchupNotice']
+    onAutoClaimFailed?: GatewayClientOptions['onAutoClaimFailed']
     log: (msg: string) => void
     wsFactory: WsFactory
   }
@@ -112,6 +129,8 @@ export class GatewayClient {
       onInbound: options.onInbound,
       onPermissionReply: options.onPermissionReply,
       onHandlerLost: options.onHandlerLost,
+      onCatchupNotice: options.onCatchupNotice,
+      onAutoClaimFailed: options.onAutoClaimFailed,
       log: options.log ?? ((m) => process.stderr.write('line-gateway-plugin: ' + m + '\n')),
       wsFactory: options.wsFactory ?? defaultFactory,
     }
@@ -272,6 +291,15 @@ export class GatewayClient {
             previous_handler: frame.previous_handler ?? null,
           })
           this.pendingClaim = null
+        } else if (!frame.ok) {
+          // No pending claimWithAck means this ack is for the fire-and-
+          // forget claimOnConnect attempt — the only other caller of
+          // claim(). It lost the race; tell the owner so it isn't
+          // silently un-handled.
+          this.opts.onAutoClaimFailed?.({
+            reason: frame.reason,
+            previous_handler: frame.previous_handler ?? null,
+          })
         }
         return
       case 'inbound':
@@ -283,6 +311,9 @@ export class GatewayClient {
       case 'handler_lost':
         this.isHandler = false
         this.opts.onHandlerLost?.(frame.displaced_by)
+        return
+      case 'catchup_notice':
+        this.opts.onCatchupNotice?.({ since: frame.since, gap_ms: frame.gap_ms, count: frame.count })
         return
       case 'pong':
         return

@@ -113,6 +113,9 @@ export interface InboundEnrichment {
   quoted_ts?: string
   quoted_type?: string
   quoted_text?: string
+  /** Present when the quoted message was part of a multi-image LINE album share. */
+  quoted_image_set_index?: number
+  quoted_image_set_total?: number
   /** Sender's LINE displayName, resolved server-side by gateway cache. */
   user_name?: string
 }

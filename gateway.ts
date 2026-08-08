@@ -17,7 +17,7 @@ import { PermissionRouter } from './permissions'
 import { verifySignature, dispatch } from './webhook'
 import { readAccess } from './access'
 import type { LineConfig } from './env'
-import { openDatabase, fetchMessages, recentChatIds, getMessageById } from './db'
+import { openDatabase, fetchMessages, recentChatIds, getMessageById, getQuoteToken, getImageSetMessages } from './db'
 import { saveUpload, resolveStaticPath, sweepUploads, DEFAULT_TTL_MS as UPLOADS_TTL_MS } from './uploads'
 import {
   ReplyTokenCache, SentIdSet, DisplayNameCache, sendTextReplyPreferred,
@@ -67,6 +67,19 @@ export interface GatewayHandle {
 // Original plugin used session-scoped KNOWN_CHAT_IDS; with multi-session
 // sharing one archive, a time window is the sensible equivalent.
 const DEFAULT_SEND_IMAGE_ALLOW_WINDOW_MS = 24 * 60 * 60 * 1000
+
+// Skip near-instant reconnect blips when deciding whether to send a
+// catch-up notice — dispatch() suspending delivery for a couple hundred
+// ms is unlikely to have actually dropped anything, and firing a notice
+// on every routine /mcp reconnect would just be noise.
+const CATCHUP_MIN_GAP_MS = 2000
+
+// Same +08:00-shift trick as isRecentChat() below — produces a Taipei-
+// offset ISO string comparable against `received_at` (stored in the
+// same format) without pulling in a timezone library.
+function toTaipeiIso(ms: number): string {
+  return new Date(ms + 8 * 3600 * 1000).toISOString().replace('Z', '+08:00')
+}
 
 export function startGateway(opts: GatewayOptions): GatewayHandle {
   const registry = new ConnectionRegistry()
@@ -356,6 +369,29 @@ export function startGateway(opts: GatewayOptions): GatewayHandle {
                 displaced_by: ws.data.cc_session_id,
               })
             }
+            // Catch-up: while this session's connection was down, dispatch()
+            // suspended inbound delivery for the whole gap (HandlerManager.
+            // isHandler() is false during grace) — messages still land in
+            // the archive but never reach the handler. A meaningful gap on
+            // reclaim means there may be a silent backlog; tell the session
+            // so it knows to fetch_messages instead of never finding out.
+            if (outcome.ok && outcome.reconnectGapMs !== undefined && outcome.reconnectGapMs > CATCHUP_MIN_GAP_MS) {
+              const sinceIso = toTaipeiIso(Date.now() - outcome.reconnectGapMs)
+              const missed = fetchMessages(db, { since: sinceIso, limit: 500 })
+              if (missed.length > 0) {
+                send(ws, {
+                  type: 'catchup_notice',
+                  since: sinceIso,
+                  gap_ms: outcome.reconnectGapMs,
+                  count: missed.length,
+                })
+                process.stderr.write(
+                  'line-gateway: catchup cc=' + ws.data.cc_session_id +
+                  ' gap_ms=' + outcome.reconnectGapMs +
+                  ' missed=' + missed.length + '\n',
+                )
+              }
+            }
             break
           }
 
@@ -513,7 +549,20 @@ async function handleApiRequest(
       case 'reply': {
         const chat_id = requireStr(args.chat_id, 'reply.chat_id')
         const text    = requireStr(args.text, 'reply.text')
-        const quoteToken = typeof args.quote_token === 'string' ? args.quote_token : undefined
+        // quote_message_id is the preferred path — caller passes the plain
+        // inbound message_id and gateway resolves the real (opaque, easy
+        // to mistype by hand) quoteToken from its own archive. quote_token
+        // stays as a direct-value fallback for backward compat.
+        const quoteMessageId = typeof args.quote_message_id === 'string' ? args.quote_message_id : undefined
+        let quoteToken = typeof args.quote_token === 'string' ? args.quote_token : undefined
+        if (!quoteToken && quoteMessageId) {
+          const resolved = getQuoteToken(deps.db, quoteMessageId)
+          if (!resolved) {
+            return fail(frame.req_id,
+              'reply: quote_message_id "' + quoteMessageId + '" not found in archive or has no quote token')
+          }
+          quoteToken = resolved
+        }
         const mentionUserIds = Array.isArray(args.mention_user_ids)
           ? args.mention_user_ids.filter((x): x is string => typeof x === 'string')
           : undefined
@@ -578,9 +627,22 @@ async function handleApiRequest(
         // WSS frames lean (binary never crosses WSS).
         const stream = await resolveContentStream(message_id, token, deps.db)
         try { await stream.body.cancel() } catch {}
+        // If this message is one image of a multi-image LINE "album"
+        // share, tell the caller about every member (ordered) so it can
+        // pull the whole set instead of just the one it happened to
+        // reference — this is the whole point of the imageSet columns.
+        const row = getMessageById(deps.db, message_id)
+        const imageSet = row?.image_set_id
+          ? {
+              id: row.image_set_id,
+              total: row.image_set_total ?? undefined,
+              message_ids: getImageSetMessages(deps.db, row.image_set_id).map((r) => r.id),
+            }
+          : undefined
         return ok(frame.req_id, {
           content_type: stream.contentType,
           content_length: stream.contentLength,
+          ...(imageSet ? { image_set: imageSet } : {}),
         })
       }
 
@@ -636,10 +698,7 @@ function requireStr(v: unknown, field: string): string {
 function isRecentChat(db: Database, chatId: string, windowMs: number): boolean {
   // received_at is a Taipei-offset ISO string (`...+08:00`); for a correct
   // lexicographic compare, build the cutoff in the same format.
-  const cutoffDate = new Date(Date.now() - windowMs)
-  const tpe = new Date(cutoffDate.getTime() + 8 * 3600 * 1000)
-    .toISOString().replace('Z', '+08:00')
-  return recentChatIds(db, tpe).includes(chatId)
+  return recentChatIds(db, toTaipeiIso(Date.now() - windowMs)).includes(chatId)
 }
 
 // --- gofile.io upload -------------------------------------------------------

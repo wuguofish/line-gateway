@@ -24,6 +24,11 @@ const gatewayUrl = process.env.LINE_GATEWAY_URL ?? DEFAULT_URL
 const ccSessionId = process.env.CLAUDE_SESSION_ID ?? process.env.CLAUDE_CODE_SESSION_ID ?? ''
 const stateDir = process.env.LINE_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'line')
 const pluginVersion = readPluginVersion()
+// Opt OUT only — default stays true so every existing duty session's
+// config keeps working unchanged. A session that loads this plugin but
+// isn't the intended LINE duty session should set this to '0'/'false' so
+// it doesn't silently win the handler seat on a gateway-restart race.
+const autoClaim = process.env.LINE_GATEWAY_AUTO_CLAIM !== '0' && process.env.LINE_GATEWAY_AUTO_CLAIM !== 'false'
 
 if (!ccSessionId) {
   process.stderr.write(
@@ -36,6 +41,7 @@ const { mcp, stop } = createPlugin({
   ccSessionId: ccSessionId || 'anon-' + process.pid,
   pluginVersion,
   stateDir,
+  autoClaim,
 })
 
 const transport = new StdioServerTransport()

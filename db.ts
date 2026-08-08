@@ -16,6 +16,62 @@ import { fileURLToPath } from 'url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
+/**
+ * Idempotent `ALTER TABLE ADD COLUMN` — SQLite has no `ADD COLUMN IF NOT
+ * EXISTS`, so existing databases (created before a column existed) need
+ * this instead of `CREATE TABLE IF NOT EXISTS` catching up on its own.
+ * Fresh databases already get the column from schema.sql's CREATE TABLE,
+ * so this is a no-op for them (PRAGMA table_info already lists it).
+ */
+function ensureColumn(db: Database, table: string, column: string, ddl: string): void {
+  const cols = db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all()
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`)
+  }
+}
+
+/**
+ * One-time (self-correcting, safe to run every startup) backfill for
+ * rows archived BEFORE the image_set_* columns existed. ensureColumn()
+ * only adds the columns for future INSERTs — it can't retroactively
+ * populate old rows — but their raw_json already has the imageSet data,
+ * so we parse it back out here. Bounded to image rows with the column
+ * still NULL, so after the first run this is an empty-result no-op.
+ */
+function backfillImageSetColumns(db: Database): number {
+  const rows = db.query<{ id: string; raw_json: string }, []>(
+    `SELECT id, raw_json FROM messages WHERE message_type = 'image' AND image_set_id IS NULL`,
+  ).all()
+  if (rows.length === 0) return 0
+
+  const update = db.query(
+    `UPDATE messages SET image_set_id = ?, image_set_index = ?, image_set_total = ? WHERE id = ?`,
+  )
+  let updated = 0
+  const runBackfill = db.transaction(() => {
+    for (const row of rows) {
+      let parsed: { message?: { imageSet?: { id?: unknown; index?: unknown; total?: unknown } } }
+      try {
+        parsed = JSON.parse(row.raw_json)
+      } catch {
+        continue // malformed raw_json — leave the row alone
+      }
+      const imageSet = parsed.message?.imageSet
+      if (imageSet && typeof imageSet.id === 'string') {
+        update.run(
+          imageSet.id,
+          typeof imageSet.index === 'number' ? imageSet.index : null,
+          typeof imageSet.total === 'number' ? imageSet.total : null,
+          row.id,
+        )
+        updated++
+      }
+    }
+  })
+  runBackfill()
+  return updated
+}
+
 export function openDatabase(path: string): Database {
   const db = new Database(path)
   db.exec('PRAGMA journal_mode = WAL')
@@ -23,6 +79,17 @@ export function openDatabase(path: string): Database {
 
   const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8')
   db.exec(schema)
+
+  ensureColumn(db, 'messages', 'image_set_id', 'image_set_id TEXT')
+  ensureColumn(db, 'messages', 'image_set_index', 'image_set_index INTEGER')
+  ensureColumn(db, 'messages', 'image_set_total', 'image_set_total INTEGER')
+  db.exec('CREATE INDEX IF NOT EXISTS idx_messages_image_set ON messages(image_set_id, image_set_index)')
+
+  const backfilled = backfillImageSetColumns(db)
+  if (backfilled > 0) {
+    process.stderr.write('line-gateway: backfilled image_set_id/index/total for ' + backfilled + ' archived image(s)\n')
+  }
+
   return db
 }
 
@@ -35,6 +102,9 @@ export interface MessageRow {
   line_ts: number | null
   received_at: string
   raw_json: string
+  image_set_id: string | null
+  image_set_index: number | null
+  image_set_total: number | null
 }
 
 // Mirror of the subset of the LINE webhook event shape we actually use
@@ -53,6 +123,12 @@ export interface InboundMessageEvent {
     id?: string
     type?: string
     text?: string
+    /** Present when sent as part of a multi-image "album" share. */
+    imageSet?: {
+      id?: string
+      index?: number
+      total?: number
+    }
   }
   [k: string]: unknown
 }
@@ -90,6 +166,7 @@ export function insertMessage(
   const chatId = extractChatId(event)
   if (!chatId) return null
 
+  const imageSet = msg.imageSet
   const row = {
     id: msg.id,
     chat_id: chatId,
@@ -99,17 +176,22 @@ export function insertMessage(
     line_ts: typeof event.timestamp === 'number' ? event.timestamp : null,
     received_at: receivedAt,
     raw_json: JSON.stringify(event),
+    image_set_id: typeof imageSet?.id === 'string' ? imageSet.id : null,
+    image_set_index: typeof imageSet?.index === 'number' ? imageSet.index : null,
+    image_set_total: typeof imageSet?.total === 'number' ? imageSet.total : null,
   }
 
   db.query(`
     INSERT OR IGNORE INTO messages
-      (id, chat_id, sender_user_id, message_type, text, line_ts, received_at, raw_json)
+      (id, chat_id, sender_user_id, message_type, text, line_ts, received_at, raw_json,
+       image_set_id, image_set_index, image_set_total)
     VALUES
-      (?, ?, ?, ?, ?, ?, ?, ?)
+      (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     row.id, row.chat_id, row.sender_user_id,
     row.message_type, row.text, row.line_ts,
     row.received_at, row.raw_json,
+    row.image_set_id, row.image_set_index, row.image_set_total,
   )
   return row.id
 }
@@ -144,7 +226,8 @@ export function fetchMessages(db: Database, opts: FetchMessagesOptions = {}): Me
   args.push(limit)
 
   return db.query<MessageRow, (string | number)[]>(`
-    SELECT id, chat_id, sender_user_id, message_type, text, line_ts, received_at, raw_json
+    SELECT id, chat_id, sender_user_id, message_type, text, line_ts, received_at, raw_json,
+           image_set_id, image_set_index, image_set_total
     FROM messages
     ${where}
     ORDER BY received_at DESC, id DESC
@@ -172,10 +255,45 @@ export function hasMessageId(db: Database, id: string): boolean {
 /** Full row lookup for quoted-message enrichment. Null when absent. */
 export function getMessageById(db: Database, id: string): MessageRow | null {
   const r = db.query<MessageRow, [string]>(`
-    SELECT id, chat_id, sender_user_id, message_type, text, line_ts, received_at, raw_json
+    SELECT id, chat_id, sender_user_id, message_type, text, line_ts, received_at, raw_json,
+           image_set_id, image_set_index, image_set_total
     FROM messages WHERE id = ? LIMIT 1
   `).get(id)
   return r ?? null
+}
+
+/**
+ * All archived messages sharing the same `imageSet.id`, ordered by their
+ * position in the album. Used so `get_content` on any one member of a
+ * multi-image LINE share can return the whole set instead of just the
+ * message the caller happened to reference.
+ */
+export function getImageSetMessages(db: Database, imageSetId: string): MessageRow[] {
+  return db.query<MessageRow, [string]>(`
+    SELECT id, chat_id, sender_user_id, message_type, text, line_ts, received_at, raw_json,
+           image_set_id, image_set_index, image_set_total
+    FROM messages WHERE image_set_id = ? ORDER BY image_set_index ASC
+  `).all(imageSetId)
+}
+
+/**
+ * Resolve a message id to its inbound quoteToken, pulled from the
+ * archived raw_json (LINE sets `message.quoteToken` on every inbound
+ * message — insertMessage already persists the whole event). Callers
+ * use this so they can quote-reply by message_id instead of having to
+ * carry the opaque quoteToken string themselves. Returns null when the
+ * message isn't archived, or the archived event has no quoteToken.
+ */
+export function getQuoteToken(db: Database, messageId: string): string | null {
+  const row = getMessageById(db, messageId)
+  if (!row) return null
+  try {
+    const parsed = JSON.parse(row.raw_json) as { message?: { quoteToken?: unknown } }
+    const qt = parsed.message?.quoteToken
+    return typeof qt === 'string' && qt ? qt : null
+  } catch {
+    return null
+  }
 }
 
 export function countMessages(db: Database, chat_id?: string): number {

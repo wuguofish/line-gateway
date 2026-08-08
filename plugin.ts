@@ -37,9 +37,11 @@ import {
 import {
   formatInbound,
   formatPermissionBody,
+  formatCatchupNotice,
+  formatAutoClaimFailedNotice,
   type ChannelNotification,
 } from './plugin-inbound'
-import { getContent, getEmoji, uploadImageFile, gatewayHttpFromWs } from './plugin-get-content'
+import { getContent, getEmoji, uploadImageFile, gatewayHttpFromWs, type ContentBlock } from './plugin-get-content'
 
 export interface PluginOptions {
   gatewayUrl: string
@@ -47,6 +49,15 @@ export interface PluginOptions {
   pluginVersion: string
   stateDir: string
   botUserId?: string | null
+  /**
+   * Default true (unchanged behavior — every existing duty session relies
+   * on this to become handler on connect without an explicit claim_handler
+   * call). Set false for a session that loads this plugin but is NOT the
+   * intended LINE duty session — otherwise it silently wins the handler
+   * seat on any gateway restart race purely by reconnecting first, with
+   * no duty intent behind it. See reference_line_gateway_handler_seat memory.
+   */
+  autoClaim?: boolean
 }
 
 export interface PluginHandle {
@@ -74,13 +85,14 @@ const INSTRUCTIONS = [
 const TOOLS = [
   {
     name: 'reply',
-    description: 'Send a text message to a LINE chat (DM or group). Pass chat_id from the inbound message. Optionally quote-reply a message (quote_token) and/or @-mention specific users (mention_user_ids); both are combinable.',
+    description: 'Send a text message to a LINE chat (DM or group). Pass chat_id from the inbound message. Optionally quote-reply a message (quote_message_id) and/or @-mention specific users (mention_user_ids); both are combinable.',
     inputSchema: {
       type: 'object',
       properties: {
         chat_id: { type: 'string', description: 'LINE userId, groupId, or roomId' },
         text:    { type: 'string' },
-        quote_token: { type: 'string', description: 'Optional. The quote_token of the inbound message you want to quote-reply — renders a quote box so it is clear which message you are answering (handy in busy groups). quoteTokens never expire and are reusable within the same chat.' },
+        quote_message_id: { type: 'string', description: 'Optional, preferred. The message_id (from the inbound notification meta) of the message you want to quote-reply — renders a quote box so it is clear which message you are answering (handy in busy groups). Gateway resolves it internally; you never have to copy the opaque quote_token by hand.' },
+        quote_token: { type: 'string', description: 'Optional, legacy. The raw quote_token of the inbound message — prefer quote_message_id instead; this is easy to mistype since it is a long opaque string. quoteTokens never expire and are reusable within the same chat.' },
         mention_user_ids: { type: 'array', items: { type: 'string' }, description: 'Optional. LINE userIds (from inbound meta.user) to @-mention; prepended to the text. Use to notify specific people, e.g. when an async task is done. Groups/rooms only; max 20. When set, text must not contain { or }.' },
       },
       required: ['chat_id', 'text'],
@@ -100,7 +112,7 @@ const TOOLS = [
   },
   {
     name: 'get_content',
-    description: 'Fetch binary content (image/file/video/audio) sent by a LINE user. Returns a direct LINE download URL plus metadata.',
+    description: 'Fetch binary content (image/file/video/audio) sent by a LINE user. Returns a direct LINE download URL plus metadata. If the message is one image of a multi-image "album" share (LINE imageSet — inbound meta shows quoted_image_set_total when a reply quotes one), this returns EVERY image in the set, not just the one requested — pass any single message_id from the set.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -236,9 +248,29 @@ export function createPlugin(opts: PluginOptions): PluginHandle {
         const message_id = String(args.message_id ?? '')
         if (!message_id) throw new Error('get_content: message_id required')
         // Probe first — confirms the message exists and is within size
-        // limits before we ask the plugin to write bytes to disk.
-        await client.apiRequest('get_content', { message_id })
+        // limits before we ask the plugin to write bytes to disk. Also
+        // tells us whether message_id belongs to a multi-image imageSet —
+        // if so, image_set.message_ids lists every member (ordered).
+        const probe = await client.apiRequest('get_content', { message_id }) as {
+          image_set?: { id: string; total?: number; message_ids: string[] }
+        }
         const filename = typeof args.filename === 'string' ? args.filename : undefined
+        const setIds = probe.image_set?.message_ids
+        if (setIds && setIds.length > 1) {
+          // Fetch every member of the set, not just the one requested.
+          // Each id still gets its own probe (same validation the single-
+          // image path gets) — sets are small (LINE albums cap low), so
+          // the extra round trips are cheap.
+          const blocks: ContentBlock[] = []
+          for (let i = 0; i < setIds.length; i++) {
+            const id = setIds[i]!
+            if (id !== message_id) await client.apiRequest('get_content', { message_id: id })
+            const r = await getContent(id, { inboxDir, gatewayHttpUrl })
+            blocks.push({ type: 'text', text: `— image ${i + 1}/${setIds.length} (message_id: ${id}) —` })
+            blocks.push(...r.content)
+          }
+          return { content: blocks }
+        }
         const result = await getContent(message_id, {
           inboxDir,
           gatewayHttpUrl,
@@ -401,14 +433,36 @@ export function createPlugin(opts: PluginOptions): PluginHandle {
     )
   }
 
+  const handleCatchupNotice = (notice: { since: string; gap_ms: number; count: number }): void => {
+    const notification = formatCatchupNotice(notice)
+    void mcp.notification({
+      method: 'notifications/claude/channel',
+      params: notification as unknown as Record<string, unknown>,
+    }).catch(e =>
+      process.stderr.write('line-gateway-plugin: catchup notify failed: ' + e + '\n'),
+    )
+  }
+
+  const handleAutoClaimFailed = (info: { reason?: string; previous_handler: string | null }): void => {
+    const notification = formatAutoClaimFailedNotice(info)
+    void mcp.notification({
+      method: 'notifications/claude/channel',
+      params: notification as unknown as Record<string, unknown>,
+    }).catch(e =>
+      process.stderr.write('line-gateway-plugin: auto-claim-failed notify failed: ' + e + '\n'),
+    )
+  }
+
   const client = new GatewayClient({
     url: opts.gatewayUrl,
     cc_session_id: opts.ccSessionId,
     pid: process.pid,
     plugin_version: opts.pluginVersion,
-    claimOnConnect: true,
+    claimOnConnect: opts.autoClaim ?? true,
     onInbound: handleInbound,
     onPermissionReply: handlePermissionReply,
+    onCatchupNotice: handleCatchupNotice,
+    onAutoClaimFailed: handleAutoClaimFailed,
     onHandlerLost: (displaced_by) => {
       process.stderr.write(
         'line-gateway-plugin: handler seat lost' +
