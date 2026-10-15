@@ -109,15 +109,61 @@ export class SentIdSet {
 
   /** Best-effort extraction of message ids from a Reply/Push API response body. */
   recordFromResponseText(body: string): void {
-    try {
-      const parsed = JSON.parse(body) as { sentMessages?: Array<{ id?: unknown }> }
-      const arr = parsed.sentMessages
-      if (!Array.isArray(arr)) return
-      for (const m of arr) {
-        if (typeof m?.id === 'string' && m.id.length > 0) this.add(m.id)
-      }
-    } catch { /* ignore malformed response bodies */ }
+    for (const id of extractSentIds(body)) this.add(id)
   }
+}
+
+/**
+ * Message ids LINE assigned to a send, in the order we sent them —
+ * `sentMessages[i]` corresponds to `messages[i]` of the request. Callers
+ * zip the two so each id keeps the text it belongs to.
+ *
+ * Best-effort: a malformed or unexpected body yields an empty list
+ * rather than failing the send that already succeeded.
+ */
+export function extractSentIds(body: string): string[] {
+  try {
+    const parsed = JSON.parse(body) as { sentMessages?: Array<{ id?: unknown }> }
+    const arr = parsed.sentMessages
+    if (!Array.isArray(arr)) return []
+    return arr
+      .map((m) => m?.id)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0)
+  } catch {
+    return []  // malformed response body
+  }
+}
+
+/** One message this gateway sent, paired with the text it carried. */
+export interface SentMessageRecord {
+  id: string
+  /** LINE message type as archived: 'text' or 'image'. */
+  type: string
+  text: string | null
+}
+
+/**
+ * Zip the ids LINE returned with the payload we posted, appending to
+ * `out`. Read the response body defensively — the send already
+ * succeeded, so a surprise here must not turn into a thrown error.
+ */
+async function collectSent(
+  res: Response,
+  payload: Array<{ type: string; text?: string }>,
+  out: SentMessageRecord[],
+  sentIds?: SentIdSet,
+): Promise<void> {
+  let ids: string[] = []
+  try { ids = extractSentIds(await res.clone().text()) } catch { return }
+  ids.forEach((id, i) => {
+    sentIds?.add(id)
+    const item = payload[i]
+    out.push({
+      id,
+      type: item?.type === 'image' ? 'image' : 'text',
+      text: typeof item?.text === 'string' ? item.text : null,
+    })
+  })
 }
 
 // --- ReplyTokenCache --------------------------------------------------------
@@ -216,6 +262,8 @@ export interface TextSendOptions {
 export interface TextSendResult {
   method: 'reply' | 'push' | 'mixed'
   chunks: number
+  /** What LINE accepted, in send order — one entry per delivered chunk. */
+  sent: SentMessageRecord[]
 }
 
 /**
@@ -237,6 +285,7 @@ export async function sendTextReplyPreferred(
     return sendSingleMessageReplyPreferred(
       chatId,
       buildMentionUserMessage(text, opts.mentionUserIds, opts.quoteToken),
+      text,
       token,
       opts,
     )
@@ -252,32 +301,31 @@ export async function sendTextReplyPreferred(
       messages: firstBatch,
     }, token)
     if (res.ok) {
-      if (opts.sentIds) {
-        try { opts.sentIds.recordFromResponseText(await res.clone().text()) } catch {}
-      }
+      const sent: SentMessageRecord[] = []
+      await collectSent(res, firstBatch, sent, opts.sentIds)
       if (chunks.length > 5) {
         // Best-effort push of the tail. If this fails, surface an error —
         // caller decides how to message the user about the partial send.
         // No quoteToken on the tail — the quote already rode the first chunk.
         try {
-          await pushText(chatId, chunks.slice(5).join('\n'), token, { ...opts, quoteToken: undefined })
+          sent.push(...await pushText(chatId, chunks.slice(5).join('\n'), token, { ...opts, quoteToken: undefined }))
         } catch (pushErr) {
           throw new Error(
             'partial send: first chunks delivered via Reply API, ' +
             'but push of remaining chunks failed: ' + (pushErr instanceof Error ? pushErr.message : String(pushErr)),
           )
         }
-        return { method: 'mixed', chunks: chunks.length }
+        return { method: 'mixed', chunks: chunks.length, sent }
       }
-      return { method: 'reply', chunks: chunks.length }
+      return { method: 'reply', chunks: chunks.length, sent }
     }
     // Reply API rejected our token (expired / replayed) — log and fall through.
     await lineErrorSummary(res, 'LINE reply')
   }
 
   // Whole message via Push — quoteToken (if any) rides the first chunk.
-  await pushText(chatId, text, token, opts)
-  return { method: 'push', chunks: chunks.length }
+  const sent = await pushText(chatId, text, token, opts)
+  return { method: 'push', chunks: chunks.length, sent }
 }
 
 export async function pushText(
@@ -285,18 +333,18 @@ export async function pushText(
   text: string,
   token: string,
   opts: { chunkLimit: number; chunkMode: ChunkMode; sentIds?: SentIdSet; quoteToken?: string },
-): Promise<void> {
+): Promise<SentMessageRecord[]> {
   const chunks = splitText(text, opts.chunkLimit, opts.chunkMode)
+  const sent: SentMessageRecord[] = []
   // LINE allows up to 5 messages per push call.
   for (let i = 0; i < chunks.length; i += 5) {
     // quoteToken only on the very first message of the very first batch.
     const batch = textMessages(chunks.slice(i, i + 5), i === 0 ? opts.quoteToken : undefined)
     const res = await postLineJson('/message/push', { to, messages: batch }, token)
     if (!res.ok) throw new Error(await lineErrorSummary(res, 'LINE push'))
-    if (opts.sentIds) {
-      try { opts.sentIds.recordFromResponseText(await res.clone().text()) } catch {}
-    }
+    await collectSent(res, batch, sent, opts.sentIds)
   }
+  return sent
 }
 
 // --- textV2 mentions --------------------------------------------------------
@@ -417,22 +465,27 @@ export function textMessages(
 async function sendSingleMessageReplyPreferred(
   chatId: string,
   message: unknown,
+  /** Plain text to archive — the textV2 payload carries mention markup. */
+  archiveText: string,
   token: string,
   opts: { replyTokens?: ReplyTokenCache; sentIds?: SentIdSet },
 ): Promise<TextSendResult> {
+  const archivePayload = [{ type: 'text', text: archiveText }]
   const replyToken = opts.replyTokens?.consume(chatId) ?? null
   if (replyToken !== null) {
     const res = await postLineJson('/message/reply', { replyToken, messages: [message] }, token)
     if (res.ok) {
-      if (opts.sentIds) { try { opts.sentIds.recordFromResponseText(await res.clone().text()) } catch {} }
-      return { method: 'reply', chunks: 1 }
+      const replied: SentMessageRecord[] = []
+      await collectSent(res, archivePayload, replied, opts.sentIds)
+      return { method: 'reply', chunks: 1, sent: replied }
     }
     await lineErrorSummary(res, 'LINE reply (textV2)')
   }
   const res = await postLineJson('/message/push', { to: chatId, messages: [message] }, token)
   if (!res.ok) throw new Error(await lineErrorSummary(res, 'LINE push (textV2)'))
-  if (opts.sentIds) { try { opts.sentIds.recordFromResponseText(await res.clone().text()) } catch {} }
-  return { method: 'push', chunks: 1 }
+  const pushed: SentMessageRecord[] = []
+  await collectSent(res, archivePayload, pushed, opts.sentIds)
+  return { method: 'push', chunks: 1, sent: pushed }
 }
 
 /**
@@ -444,7 +497,7 @@ export async function sendMentionAllReplyPreferred(
   token: string,
   opts: { replyTokens?: ReplyTokenCache; sentIds?: SentIdSet; quoteToken?: string } = {},
 ): Promise<TextSendResult> {
-  return sendSingleMessageReplyPreferred(chatId, buildMentionAllMessage(text, opts.quoteToken), token, opts)
+  return sendSingleMessageReplyPreferred(chatId, buildMentionAllMessage(text, opts.quoteToken), text, token, opts)
 }
 
 // --- Permission push --------------------------------------------------------
@@ -462,7 +515,7 @@ export async function pushPermission(
   requestId: string,
   token: string,
   sentIds?: SentIdSet,
-): Promise<void> {
+): Promise<SentMessageRecord[]> {
   const message = {
     type: 'text',
     text: body,
@@ -475,9 +528,9 @@ export async function pushPermission(
   }
   const res = await postLineJson('/message/push', { to, messages: [message] }, token)
   if (!res.ok) throw new Error(await lineErrorSummary(res, 'LINE push (permission)'))
-  if (sentIds) {
-    try { sentIds.recordFromResponseText(await res.clone().text()) } catch {}
-  }
+  const sent: SentMessageRecord[] = []
+  await collectSent(res, [{ type: 'text', text: body }], sent, sentIds)
+  return sent
 }
 
 // --- sendImage --------------------------------------------------------------
@@ -488,15 +541,15 @@ export async function sendImage(
   previewUrl: string,
   token: string,
   sentIds?: SentIdSet,
-): Promise<void> {
+): Promise<SentMessageRecord[]> {
   const res = await postLineJson('/message/push', {
     to,
     messages: [{ type: 'image', originalContentUrl: originalUrl, previewImageUrl: previewUrl }],
   }, token)
   if (!res.ok) throw new Error(await lineErrorSummary(res, 'send_image'))
-  if (sentIds) {
-    try { sentIds.recordFromResponseText(await res.clone().text()) } catch {}
-  }
+  const sent: SentMessageRecord[] = []
+  await collectSent(res, [{ type: 'image' }], sent, sentIds)
+  return sent
 }
 
 // --- markAsRead -------------------------------------------------------------
@@ -719,7 +772,7 @@ export async function getRoomMemberProfile(
 export type DisplayNameSource = 'user' | 'group' | 'room'
 
 export interface DisplayNameCacheOptions {
-  /** Cache entry lifetime before a re-fetch is needed. Default 1 hour. */
+  /** Cache entry lifetime before a re-fetch is needed. Default 24 hours. */
   ttlMs?: number
   /** Max entries before LRU eviction. Default 500. */
   maxSize?: number
@@ -742,7 +795,7 @@ export class DisplayNameCache {
     private readonly fetcher: DisplayNameFetcher,
     opts: DisplayNameCacheOptions = {},
   ) {
-    this.ttlMs = opts.ttlMs ?? 60 * 60 * 1000
+    this.ttlMs = opts.ttlMs ?? 24 * 60 * 60 * 1000
     this.maxSize = opts.maxSize ?? 500
     this.now = opts.now ?? (() => Date.now())
   }

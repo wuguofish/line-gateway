@@ -63,6 +63,32 @@ describe('GatewayClient', () => {
     c.stop()
   })
 
+  test('Codex clients identify client_kind and wait for hello_ack', async () => {
+    const c = new GatewayClient({
+      log: () => {},
+      url: 'ws://x', cc_session_id: 'codex-duty', client_kind: 'codex', pid: 42, plugin_version: '0.1',
+      wsFactory: factoryHolder.factory,
+    })
+    c.start()
+    const ws = factoryHolder.latest()
+    ws.open()
+    expect(JSON.parse(ws.sent[0]!)).toEqual({
+      type: 'hello',
+      cc_session_id: 'codex-duty',
+      client_kind: 'codex',
+      pid: 42,
+      plugin_version: '0.1',
+    })
+    let ready = false
+    const waiting = c.waitUntilReady().then(() => { ready = true })
+    await Bun.sleep(0)
+    expect(ready).toBe(false)
+    ws.messageJson({ type: 'hello_ack', is_handler: false, current_handler: null, gateway_version: '0.1' })
+    await waiting
+    expect(ready).toBe(true)
+    c.stop()
+  })
+
   test('claimOnConnect sends claim right after hello', () => {
     const c = new GatewayClient({
       log: () => {},
@@ -283,6 +309,61 @@ describe('GatewayClient', () => {
     wsList[0]!.close(1006, 'bye')
     await Bun.sleep(30)
     expect(factoryCalls).toBeGreaterThanOrEqual(2)
+    c.stop()
+  })
+
+  test('reconnect reclaims only after an explicit successful claim', async () => {
+    const wsList: FakeWs[] = []
+    const factory: WsFactory = () => {
+      const ws = new FakeWs()
+      wsList.push(ws)
+      return ws
+    }
+    const c = new GatewayClient({
+      log: () => {},
+      url: 'ws://x', cc_session_id: 'codex-duty', pid: 42, plugin_version: '0.1',
+      reconnectBaseMs: 10, maxReconnectMs: 10,
+      wsFactory: factory,
+    })
+    c.start()
+    wsList[0]!.open()
+    const claim = c.claimWithAck(false)
+    wsList[0]!.messageJson({ type: 'claim_ack', ok: true, previous_handler: null })
+    await claim
+
+    wsList[0]!.close(1006, 'daemon restart')
+    await Bun.sleep(30)
+    wsList[1]!.open()
+    const sent = wsList[1]!.sent.map((frame) => JSON.parse(frame))
+    expect(sent[0].type).toBe('hello')
+    expect(sent[1]).toEqual({ type: 'claim', force: false })
+    c.stop()
+  })
+
+  test('release disables automatic reclaim after reconnect', async () => {
+    const wsList: FakeWs[] = []
+    const factory: WsFactory = () => {
+      const ws = new FakeWs()
+      wsList.push(ws)
+      return ws
+    }
+    const c = new GatewayClient({
+      log: () => {},
+      url: 'ws://x', cc_session_id: 'codex-duty', pid: 42, plugin_version: '0.1',
+      reconnectBaseMs: 10, maxReconnectMs: 10,
+      wsFactory: factory,
+    })
+    c.start()
+    wsList[0]!.open()
+    const claim = c.claimWithAck(false)
+    wsList[0]!.messageJson({ type: 'claim_ack', ok: true, previous_handler: null })
+    await claim
+    c.release()
+
+    wsList[0]!.close(1006, 'daemon restart')
+    await Bun.sleep(30)
+    wsList[1]!.open()
+    expect(wsList[1]!.sent.map((frame) => JSON.parse(frame))).toHaveLength(1)
     c.stop()
   })
 

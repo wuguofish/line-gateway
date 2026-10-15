@@ -13,6 +13,8 @@
 export interface HelloFrame {
   type: 'hello'
   cc_session_id: string
+  /** Optional client classification. Omitted by legacy Claude plugins. */
+  client_kind?: 'claude' | 'codex'
   pid: number
   plugin_version: string
 }
@@ -87,6 +89,8 @@ export interface InboundFrame {
    * this bot sent?" so the plugin's gate() can treat it as a mention.
    */
   enrichment?: {
+    /** Durable archive ordering key for cursor catch-up. */
+    received_at?: string
     /** Present only when the event carries `message.quotedMessageId`. */
     quoted_message_id?: string
     /** True when the quoted id is in SentIdSet (bot sent it via this gateway). */

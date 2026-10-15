@@ -83,7 +83,13 @@ export function openDatabase(path: string): Database {
   ensureColumn(db, 'messages', 'image_set_id', 'image_set_id TEXT')
   ensureColumn(db, 'messages', 'image_set_index', 'image_set_index INTEGER')
   ensureColumn(db, 'messages', 'image_set_total', 'image_set_total INTEGER')
+  ensureColumn(db, 'messages', 'is_bot', 'is_bot INTEGER NOT NULL DEFAULT 0')
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_image_set ON messages(image_set_id, image_set_index)')
+  // Partial index for the default "inbound only" reads. Without it the
+  // is_bot filter turns the chat-wide catch-up query (no chat_id, order
+  // by time) into a full table scan — measured at 200ms on a 136k-row
+  // archive where the plain index answered in under a millisecond.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_messages_inbound_time ON messages(received_at DESC) WHERE is_bot = 0')
 
   const backfilled = backfillImageSetColumns(db)
   if (backfilled > 0) {
@@ -105,6 +111,8 @@ export interface MessageRow {
   image_set_id: string | null
   image_set_index: number | null
   image_set_total: number | null
+  /** 1 for messages the bot sent, 0 for inbound webhook messages. */
+  is_bot: number
 }
 
 // Mirror of the subset of the LINE webhook event shape we actually use
@@ -196,12 +204,57 @@ export function insertMessage(
   return row.id
 }
 
+/**
+ * Archive a message the bot just sent, keyed by the id LINE returned in
+ * `sentMessages[]`. Rows land in the same table as inbound messages so
+ * quoted-message lookups and get_content resolve them without knowing
+ * which direction a message travelled; `is_bot = 1` keeps them out of
+ * the readers that mean "what did people say to us".
+ *
+ * `raw_json` is synthesised rather than copied from a webhook — no
+ * webhook exists for our own sends — so it carries only what LINE gave
+ * us back. Notably there is no quoteToken: LINE issues those for
+ * inbound messages only, so `reply(quote_message_id: <a bot message>)`
+ * still cannot quote us.
+ */
+export function insertBotMessage(
+  db: Database,
+  msg: { id: string; chat_id: string; message_type: string; text: string | null },
+  sentAt: string,
+  lineTs: number,
+): string {
+  const rawJson = JSON.stringify({
+    type: 'bot_message',
+    timestamp: lineTs,
+    source: { type: 'bot' },
+    message: { id: msg.id, type: msg.message_type, text: msg.text ?? undefined },
+  })
+
+  db.query(`
+    INSERT OR IGNORE INTO messages
+      (id, chat_id, sender_user_id, message_type, text, line_ts, received_at, raw_json, is_bot)
+    VALUES
+      (?, ?, NULL, ?, ?, ?, ?, ?, 1)
+  `).run(msg.id, msg.chat_id, msg.message_type, msg.text, lineTs, sentAt, rawJson)
+  return msg.id
+}
+
 export interface FetchMessagesOptions {
   chat_id?: string
   /** Upper bound on rows returned. Defaults to 50; hard cap at 500. */
   limit?: number
   /** Only include rows with received_at > this ISO timestamp. */
   since?: string
+  /** With since, resume after this id when timestamps are equal. */
+  after_id?: string
+  /** Defaults to recent-first; catch-up uses oldest-first pagination. */
+  order?: 'asc' | 'desc'
+  /**
+   * Include messages the bot sent. Off by default so every existing
+   * caller keeps seeing an inbound-only log — a handler replaying this
+   * archive would otherwise process its own words as if they were new.
+   */
+  include_bot?: boolean
 }
 
 /**
@@ -214,32 +267,42 @@ export function fetchMessages(db: Database, opts: FetchMessagesOptions = {}): Me
 
   const clauses: string[] = []
   const args: (string | number)[] = []
+  if (!opts.include_bot) clauses.push('is_bot = 0')
   if (opts.chat_id) {
     clauses.push('chat_id = ?')
     args.push(opts.chat_id)
   }
-  if (opts.since) {
+  if (opts.since && opts.after_id !== undefined) {
+    clauses.push('(received_at > ? OR (received_at = ? AND id > ?))')
+    args.push(opts.since, opts.since, opts.after_id)
+  } else if (opts.since) {
     clauses.push('received_at > ?')
     args.push(opts.since)
   }
   const where = clauses.length ? 'WHERE ' + clauses.join(' AND ') : ''
+  const order = opts.order === 'asc' ? 'ASC' : 'DESC'
   args.push(limit)
 
   return db.query<MessageRow, (string | number)[]>(`
     SELECT id, chat_id, sender_user_id, message_type, text, line_ts, received_at, raw_json,
-           image_set_id, image_set_index, image_set_total
+           image_set_id, image_set_index, image_set_total, is_bot
     FROM messages
     ${where}
-    ORDER BY received_at DESC, id DESC
+    ORDER BY received_at ${order}, id ${order}
     LIMIT ?
   `).all(...args)
 }
 
-/** Return chat_ids that received at least one message since the given ISO ts. */
+/**
+ * Return chat_ids that someone messaged us in since the given ISO ts.
+ * Bot rows are excluded on purpose: this gates send_image on "a human
+ * talked to us recently", and our own outbound would otherwise hold that
+ * gate open by itself.
+ */
 export function recentChatIds(db: Database, since: string): string[] {
   const rows = db.query<{ chat_id: string }, [string]>(`
     SELECT DISTINCT chat_id FROM messages
-    WHERE received_at > ?
+    WHERE received_at > ? AND is_bot = 0
   `).all(since)
   return rows.map(r => r.chat_id)
 }
@@ -256,7 +319,7 @@ export function hasMessageId(db: Database, id: string): boolean {
 export function getMessageById(db: Database, id: string): MessageRow | null {
   const r = db.query<MessageRow, [string]>(`
     SELECT id, chat_id, sender_user_id, message_type, text, line_ts, received_at, raw_json,
-           image_set_id, image_set_index, image_set_total
+           image_set_id, image_set_index, image_set_total, is_bot
     FROM messages WHERE id = ? LIMIT 1
   `).get(id)
   return r ?? null
@@ -271,7 +334,7 @@ export function getMessageById(db: Database, id: string): MessageRow | null {
 export function getImageSetMessages(db: Database, imageSetId: string): MessageRow[] {
   return db.query<MessageRow, [string]>(`
     SELECT id, chat_id, sender_user_id, message_type, text, line_ts, received_at, raw_json,
-           image_set_id, image_set_index, image_set_total
+           image_set_id, image_set_index, image_set_total, is_bot
     FROM messages WHERE image_set_id = ? ORDER BY image_set_index ASC
   `).all(imageSetId)
 }

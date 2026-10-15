@@ -41,6 +41,8 @@ const defaultFactory: WsFactory = (url) => new WebSocket(url) as unknown as WsLi
 export interface GatewayClientOptions {
   url: string
   cc_session_id: string
+  /** Wire-compatible client classification for handler-seat observability. */
+  client_kind?: 'claude' | 'codex'
   pid: number
   plugin_version: string
   /** If true, send `claim` right after hello so we receive inbound frames. */
@@ -64,13 +66,8 @@ export interface GatewayClientOptions {
    */
   onCatchupNotice?: (notice: { since: string; gap_ms: number; count: number }) => void
   /**
-   * Fired when the automatic claimOnConnect attempt loses the race for
-   * the handler seat. This is the ONLY caller of the fire-and-forget
-   * `claim()` method (explicit tool calls go through `claimWithAck`,
-   * which resolves its own promise instead), so any claim_ack that
-   * arrives with no pending claimWithAck is, by construction, this
-   * outcome. Without this hook a losing session has zero visibility —
-   * it silently never becomes handler and never learns why.
+   * Fired when an automatic initial claim or reconnect recovery loses
+   * the handler-seat race. Explicit tool calls go through claimWithAck.
    */
   onAutoClaimFailed?: (info: { reason?: string; previous_handler: string | null }) => void
   /** Plain log sink (stderr by default). */
@@ -96,11 +93,18 @@ interface PendingClaim {
   timer: ReturnType<typeof setTimeout>
 }
 
+interface PendingReady {
+  resolve: () => void
+  reject: (err: Error) => void
+  timer: ReturnType<typeof setTimeout>
+}
+
 export class GatewayClient {
   private ws: WsLike | null = null
   private readonly opts: Required<Omit<GatewayClientOptions,
-    'onInbound' | 'onPermissionReply' | 'onHandlerLost' | 'onCatchupNotice' | 'onAutoClaimFailed' | 'log' | 'wsFactory'
+    'client_kind' | 'onInbound' | 'onPermissionReply' | 'onHandlerLost' | 'onCatchupNotice' | 'onAutoClaimFailed' | 'log' | 'wsFactory'
   >> & {
+    client_kind?: GatewayClientOptions['client_kind']
     onInbound?: GatewayClientOptions['onInbound']
     onPermissionReply?: GatewayClientOptions['onPermissionReply']
     onHandlerLost?: GatewayClientOptions['onHandlerLost']
@@ -111,15 +115,20 @@ export class GatewayClient {
   }
   private readonly pending = new Map<string, PendingCall>()
   private pendingClaim: PendingClaim | null = null
+  private readonly pendingReady = new Set<PendingReady>()
   private reconnectAttempt = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private stopped = false
   private isHandler = false
+  private helloAcknowledged = false
+  /** Reclaim only after this process has actually acquired the seat once. */
+  private reclaimOnReconnect = false
 
   constructor(options: GatewayClientOptions) {
     this.opts = {
       url: options.url,
       cc_session_id: options.cc_session_id,
+      client_kind: options.client_kind,
       pid: options.pid,
       plugin_version: options.plugin_version,
       claimOnConnect: options.claimOnConnect ?? false,
@@ -143,8 +152,10 @@ export class GatewayClient {
 
   stop(): void {
     this.stopped = true
+    this.reclaimOnReconnect = false
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
     this.failAllPending(new Error('gateway client stopped'))
+    this.failAllReady(new Error('gateway client stopped'))
     if (this.pendingClaim) {
       clearTimeout(this.pendingClaim.timer)
       this.pendingClaim.reject(new Error('gateway client stopped'))
@@ -157,6 +168,22 @@ export class GatewayClient {
   /** True once a handler seat is held and we can route inbound to Claude. */
   handler(): boolean {
     return this.isHandler
+  }
+
+  /** Wait until the gateway has acknowledged our hello frame. */
+  async waitUntilReady(timeoutMs = 5_000): Promise<void> {
+    if (this.helloAcknowledged && this.ws?.readyState === 1) return
+    return new Promise<void>((resolve, reject) => {
+      const waiter: PendingReady = {
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          this.pendingReady.delete(waiter)
+          reject(new Error(`gateway hello timed out after ${timeoutMs}ms`))
+        }, timeoutMs),
+      }
+      this.pendingReady.add(waiter)
+    })
   }
 
   /**
@@ -197,8 +224,8 @@ export class GatewayClient {
    * handlers so the caller learns whether the seat was granted.
    *
    * Only one claim can be in-flight at a time — concurrent calls reject
-   * with "claim already in progress". `claimOnConnect` ACKs that arrive
-   * with no pending awaiter just update `isHandler` silently.
+   * with "claim already in progress". Automatic-claim ACKs arrive with
+   * no pending awaiter.
    */
   async claimWithAck(force = false, timeoutMs = 5_000): Promise<ClaimAckResult> {
     if (this.pendingClaim) {
@@ -221,6 +248,7 @@ export class GatewayClient {
   }
 
   release(): void {
+    this.reclaimOnReconnect = false
     this.sendFrame({ type: 'release' })
   }
 
@@ -244,10 +272,11 @@ export class GatewayClient {
         this.sendFrame({
           type: 'hello',
           cc_session_id: this.opts.cc_session_id,
+          ...(this.opts.client_kind ? { client_kind: this.opts.client_kind } : {}),
           pid: this.opts.pid,
           plugin_version: this.opts.plugin_version,
         })
-        if (this.opts.claimOnConnect) this.claim(false)
+        if (this.opts.claimOnConnect || this.reclaimOnReconnect) this.claim(false)
       } catch (e) {
         this.opts.log('hello send failed: ' + (e instanceof Error ? e.message : String(e)))
       }
@@ -266,6 +295,7 @@ export class GatewayClient {
     ws.addEventListener('close', (ev) => {
       this.opts.log(`ws closed code=${ev.code} reason=${ev.reason || '<none>'}`)
       this.isHandler = false
+      this.helloAcknowledged = false
       this.ws = null
       if (!this.stopped) this.scheduleReconnect()
     })
@@ -280,10 +310,13 @@ export class GatewayClient {
     switch (frame.type) {
       case 'hello_ack':
         this.isHandler = frame.is_handler
+        this.helloAcknowledged = true
+        this.resolveAllReady()
         return
       case 'claim_ack':
         if (frame.ok) this.isHandler = true
         if (this.pendingClaim) {
+          this.reclaimOnReconnect = frame.ok
           clearTimeout(this.pendingClaim.timer)
           this.pendingClaim.resolve({
             ok: frame.ok,
@@ -292,10 +325,9 @@ export class GatewayClient {
           })
           this.pendingClaim = null
         } else if (!frame.ok) {
-          // No pending claimWithAck means this ack is for the fire-and-
-          // forget claimOnConnect attempt — the only other caller of
-          // claim(). It lost the race; tell the owner so it isn't
-          // silently un-handled.
+          this.reclaimOnReconnect = false
+          // No pending claimWithAck means this is an automatic initial
+          // claim or reconnect recovery. Surface a lost race.
           this.opts.onAutoClaimFailed?.({
             reason: frame.reason,
             previous_handler: frame.previous_handler ?? null,
@@ -310,6 +342,7 @@ export class GatewayClient {
         return
       case 'handler_lost':
         this.isHandler = false
+        this.reclaimOnReconnect = false
         this.opts.onHandlerLost?.(frame.displaced_by)
         return
       case 'catchup_notice':
@@ -338,6 +371,22 @@ export class GatewayClient {
       p.reject(err)
       this.pending.delete(id)
     }
+  }
+
+  private resolveAllReady(): void {
+    for (const waiter of this.pendingReady) {
+      clearTimeout(waiter.timer)
+      waiter.resolve()
+    }
+    this.pendingReady.clear()
+  }
+
+  private failAllReady(err: Error): void {
+    for (const waiter of this.pendingReady) {
+      clearTimeout(waiter.timer)
+      waiter.reject(err)
+    }
+    this.pendingReady.clear()
   }
 
   private scheduleReconnect(): void {

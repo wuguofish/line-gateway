@@ -14,10 +14,13 @@ import { ConnectionRegistry, type ConnectionData } from './connections'
 import { HandlerManager } from './handler'
 import { parseFrame, type PluginToGateway, type GatewayToPlugin } from './protocol'
 import { PermissionRouter } from './permissions'
-import { verifySignature, dispatch } from './webhook'
+import { verifySignature, dispatch, buildEnrichment } from './webhook'
 import { readAccess } from './access'
 import type { LineConfig } from './env'
-import { openDatabase, fetchMessages, recentChatIds, getMessageById, getQuoteToken, getImageSetMessages } from './db'
+import {
+  openDatabase, fetchMessages, recentChatIds, getMessageById, getQuoteToken,
+  getImageSetMessages, insertBotMessage,
+} from './db'
 import { saveUpload, resolveStaticPath, sweepUploads, DEFAULT_TTL_MS as UPLOADS_TTL_MS } from './uploads'
 import {
   ReplyTokenCache, SentIdSet, DisplayNameCache, sendTextReplyPreferred,
@@ -25,7 +28,7 @@ import {
   pushPermission, sendImage, markAsRead, getContentStream, getEmojiImageStream,
   getStickerImageStream, stickerIdFromRawJson, fetchWithTimeout,
   getProfile, getGroupMemberProfile, getRoomMemberProfile,
-  type ChunkMode, type GetContentStream,
+  type ChunkMode, type GetContentStream, type SentMessageRecord,
 } from './line-api'
 
 export const GATEWAY_VERSION = '0.1.0'
@@ -139,6 +142,7 @@ export function startGateway(opts: GatewayOptions): GatewayHandle {
         const upgraded = server.upgrade(req, {
           data: {
             cc_session_id: ccHint,
+            client_kind: undefined,
             pid: 0,
             plugin_version: '',
             connected_at: Date.now(),
@@ -323,6 +327,7 @@ export function startGateway(opts: GatewayOptions): GatewayHandle {
         switch (frame.type) {
           case 'hello': {
             ws.data.cc_session_id = frame.cc_session_id
+            ws.data.client_kind = frame.client_kind
             ws.data.pid = frame.pid
             ws.data.plugin_version = frame.plugin_version
             registry.add(ws, { ...ws.data })
@@ -334,6 +339,7 @@ export function startGateway(opts: GatewayOptions): GatewayHandle {
             })
             process.stderr.write(
               'line-gateway: hello cc=' + frame.cc_session_id +
+              ' kind=' + (frame.client_kind ?? 'claude') +
               ' pid=' + frame.pid +
               ' plugin=' + frame.plugin_version +
               ' handler=' + (handlers.currentHandler() ?? '<none>') + '\n',
@@ -532,8 +538,19 @@ async function handleApiRequest(
     const chat_id = typeof args.chat_id === 'string' ? args.chat_id : undefined
     const limit   = typeof args.limit   === 'number' ? args.limit   : undefined
     const since   = typeof args.since   === 'string' ? args.since   : undefined
-    const rows = fetchMessages(deps.db, { chat_id, limit, since })
-    return ok(frame.req_id, { messages: rows })
+    const after_id = typeof args.after_id === 'string' ? args.after_id : undefined
+    const order = args.order === 'asc' ? 'asc' : 'desc'
+    const include_bot = args.include_bot === true
+    const rows = fetchMessages(deps.db, { chat_id, limit, since, after_id, order, include_bot })
+    const messages = rows.map((row) => {
+      let event: unknown
+      try { event = JSON.parse(row.raw_json) } catch { event = null }
+      const enrichment = event
+        ? buildEnrichment(event as any, { db: deps.db, sentIds: deps.sentIds })
+        : undefined
+      return { ...row, enrichment: { ...enrichment, received_at: row.received_at } }
+    })
+    return ok(frame.req_id, { messages })
   }
 
   if (!deps.lineConfig || !deps.lineConfig.configured) {
@@ -570,14 +587,21 @@ async function handleApiRequest(
           chunkLimit, chunkMode, replyTokens: deps.replyTokens, sentIds: deps.sentIds,
           quoteToken, mentionUserIds,
         })
-        return ok(frame.req_id, r)
+        return ok(frame.req_id, {
+          method: r.method,
+          chunks: r.chunks,
+          sent_message_ids: archiveSent(deps.db, chat_id, r.sent),
+        })
       }
 
       case 'push': {
         const to   = requireStr(args.to, 'push.to')
         const text = requireStr(args.text, 'push.text')
-        await pushText(to, text, token, { chunkLimit, chunkMode, sentIds: deps.sentIds })
-        return ok(frame.req_id, { method: 'push' })
+        const sent = await pushText(to, text, token, { chunkLimit, chunkMode, sentIds: deps.sentIds })
+        return ok(frame.req_id, {
+          method: 'push',
+          sent_message_ids: archiveSent(deps.db, to, sent),
+        })
       }
 
       case 'reply_all': {
@@ -586,7 +610,11 @@ async function handleApiRequest(
         const r = await sendMentionAllReplyPreferred(chat_id, text, token, {
           replyTokens: deps.replyTokens, sentIds: deps.sentIds,
         })
-        return ok(frame.req_id, r)
+        return ok(frame.req_id, {
+          method: r.method,
+          chunks: r.chunks,
+          sent_message_ids: archiveSent(deps.db, chat_id, r.sent),
+        })
       }
 
       case 'send_image': {
@@ -599,8 +627,11 @@ async function handleApiRequest(
             'send_image rejected: chat_id "' + chat_id +
             '" has no inbound in the last 24h. Only send images to chats that recently messaged the bot.')
         }
-        await sendImage(chat_id, image_url, preview, token, deps.sentIds)
-        return ok(frame.req_id, { method: 'send_image' })
+        const sent = await sendImage(chat_id, image_url, preview, token, deps.sentIds)
+        return ok(frame.req_id, {
+          method: 'send_image',
+          sent_message_ids: archiveSent(deps.db, chat_id, sent),
+        })
       }
 
       case 'push_permission': {
@@ -610,17 +641,33 @@ async function handleApiRequest(
         // Register the routing entry *before* the push so a fast user reply
         // can't race us and hit an unknown request_id.
         deps.permissions.register(request_id, cc)
+        let sent: SentMessageRecord[]
         try {
-          await pushPermission(to, body, request_id, token, deps.sentIds)
+          sent = await pushPermission(to, body, request_id, token, deps.sentIds)
         } catch (e) {
           deps.permissions.pop(request_id)  // unwind on failure
           throw e
         }
-        return ok(frame.req_id, { method: 'push_permission' })
+        return ok(frame.req_id, {
+          method: 'push_permission',
+          sent_message_ids: archiveSent(deps.db, to, sent),
+        })
       }
 
       case 'get_content': {
         const message_id = requireStr(args.message_id, 'get_content.message_id')
+        const row = getMessageById(deps.db, message_id)
+        // A text message has no binary for LINE to serve — asking for it
+        // used to come back as a bare 400, for our own messages and for
+        // other people's alike. We archived the words, so answer from
+        // the archive and skip the download entirely.
+        if (row && row.message_type === 'text' && row.text !== null) {
+          return ok(frame.req_id, {
+            content_type: 'text/plain; charset=utf-8',
+            text: row.text,
+            is_bot: row.is_bot === 1,
+          })
+        }
         // HEAD-style probe: just pull the content-type + length without
         // reading the body. Plugin then GETs /content/<id> on loopback to
         // stream the bytes — keeping the LINE token server-side and the
@@ -631,7 +678,6 @@ async function handleApiRequest(
         // share, tell the caller about every member (ordered) so it can
         // pull the whole set instead of just the one it happened to
         // reference — this is the whole point of the imageSet columns.
-        const row = getMessageById(deps.db, message_id)
         const imageSet = row?.image_set_id
           ? {
               id: row.image_set_id,
@@ -693,6 +739,28 @@ function requireStr(v: unknown, field: string): string {
     throw new Error(field + ' must be a non-empty string')
   }
   return v
+}
+
+/**
+ * Archive what we just sent and hand back the LINE ids, so the caller
+ * can look its own words up later via `fetch_messages(include_bot: true)`.
+ * `get_content` stays out of reach for these: LINE serves binaries for
+ * inbound messages only, and our own text has no binary to serve.
+ *
+ * Archiving must never sink a send that already reached LINE, so a
+ * database error is logged and swallowed; the ids still go back.
+ */
+function archiveSent(db: Database, chatId: string, sent: SentMessageRecord[]): string[] {
+  const now = Date.now()
+  const sentAt = toTaipeiIso(now)
+  for (const m of sent) {
+    try {
+      insertBotMessage(db, { id: m.id, chat_id: chatId, message_type: m.type, text: m.text }, sentAt, now)
+    } catch (e) {
+      process.stderr.write('line-gateway: archiving sent message ' + m.id + ' failed: ' + e + '\n')
+    }
+  }
+  return sent.map((m) => m.id)
 }
 
 function isRecentChat(db: Database, chatId: string, windowMs: number): boolean {

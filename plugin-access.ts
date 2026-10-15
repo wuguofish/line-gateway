@@ -106,6 +106,8 @@ export type GateResult =
   | { action: 'drop'; reason: string }
 
 export interface InboundEnrichment {
+  /** Durable gateway archive key used by the duty cursor. */
+  received_at?: string
   quoted_message_id?: string
   quoted_is_bot_sent?: boolean
   quoted_absent_from_archive?: boolean

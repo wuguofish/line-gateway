@@ -5,7 +5,7 @@ import { ConnectionRegistry, type ConnectionData } from '../connections'
 import { HandlerManager } from '../handler'
 import { PermissionRouter } from '../permissions'
 import { ReplyTokenCache, SentIdSet } from '../line-api'
-import { openDatabase, fetchMessages, countMessages, insertMessage } from '../db'
+import { openDatabase, fetchMessages, countMessages, insertMessage, insertBotMessage } from '../db'
 
 // --- verifySignature --------------------------------------------------------
 
@@ -505,7 +505,9 @@ test('dispatch omits enrichment when message has no quotedMessageId', () => {
   }
   dispatch(payload, s.deps)
   const frame = JSON.parse(m.sent[0]!)
-  expect(frame.enrichment).toBeUndefined()
+  expect(frame.enrichment).toEqual({
+    received_at: expect.stringContaining('+08:00'),
+  })
 })
 
 test('dispatch is idempotent on duplicate webhook deliveries (archive dedupes)', () => {
@@ -569,9 +571,10 @@ test('dispatch omits user_name when cache missing the sender', () => {
   }
   dispatch(payload, { ...s.deps, displayNames })
   const frame = JSON.parse(m.sent[0]!)
-  // first-ever sighting → cache miss → user_name absent, but enrichment
-  // itself should be absent too since there's no quote either
-  expect(frame.enrichment).toBeUndefined()
+  // first-ever sighting → cache miss → user_name absent; the durable
+  // archive cursor timestamp remains present for runtime catch-up.
+  expect(frame.enrichment.user_name).toBeUndefined()
+  expect(frame.enrichment.received_at).toContain('+08:00')
 })
 
 test('dispatch combines quote-reply enrichment with user_name', () => {
@@ -623,4 +626,52 @@ test('dispatch prefetches displayName for unseen senders (fire-and-forget)', asy
   dispatch(payload, { ...s.deps, displayNames })
   const frame2 = JSON.parse(m.sent[0]!)
   expect(frame2.enrichment.user_name).toBe('name-Unewuser')
+})
+
+test('dispatch reads quoted_is_bot_sent off the archive after a restart emptied SentIdSet', () => {
+  const s = setup(null)
+  const m = mockWs()
+  s.registry.add(m.ws, mkConnData('cc-handler'))
+  s.handlers.claim('cc-handler', false)
+  const db = openDatabase(':memory:')
+  insertBotMessage(db, { id: 'bot-said', chat_id: 'Cgroup', message_type: 'text', text: '晚安' },
+    '2026-09-14T01:00:00.000+08:00', 1757784000000)
+  // No sentIds at all — exactly the state a freshly restarted gateway is in.
+  const deps = { ...s.deps, db }
+
+  const payload = {
+    events: [{
+      type: 'message',
+      source: { type: 'group', userId: 'Uabc', groupId: 'Cgroup' },
+      message: { id: 'm1', type: 'text', text: '晚安～', quotedMessageId: 'bot-said' },
+    }],
+  }
+  dispatch(payload, deps)
+  const frame = JSON.parse(m.sent[0]!)
+  expect(frame.enrichment.quoted_is_bot_sent).toBe(true)
+  expect(frame.enrichment.quoted_text).toBe('晚安')
+  expect(frame.enrichment.quoted_absent_from_archive).toBe(false)
+})
+
+test('quoting an image the bot sent renders a label instead of touching its synthesised raw_json', () => {
+  const s = setup(null)
+  const m = mockWs()
+  s.registry.add(m.ws, mkConnData('cc-handler'))
+  s.handlers.claim('cc-handler', false)
+  const db = openDatabase(':memory:')
+  insertBotMessage(db, { id: 'bot-pic', chat_id: 'Cgroup', message_type: 'image', text: null },
+    '2026-09-14T01:00:00.000+08:00', 1757784000000)
+
+  dispatch({
+    events: [{
+      type: 'message',
+      source: { type: 'group', userId: 'Uabc', groupId: 'Cgroup' },
+      message: { id: 'm1', type: 'text', text: '好可愛', quotedMessageId: 'bot-pic' },
+    }],
+  }, { ...s.deps, db })
+
+  const frame = JSON.parse(m.sent[0]!)
+  expect(frame.enrichment.quoted_is_bot_sent).toBe(true)
+  expect(frame.enrichment.quoted_type).toBe('image')
+  expect(frame.enrichment.quoted_text).toBe('[image]')
 })

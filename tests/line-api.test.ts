@@ -1,10 +1,11 @@
-import { test, expect, describe } from 'bun:test'
+import { test, expect, describe, afterEach } from 'bun:test'
 import {
   splitText, ReplyTokenCache, SentIdSet,
   stickerIdFromRawJson, getStickerImageStream, getEmojiImageStream,
   getProfile, DisplayNameCache,
   buildMentionAllMessage, buildMentionUserMessage, textMessages,
-  MENTION_ALL_MAX_LEN, MAX_MENTIONS,
+  MENTION_ALL_MAX_LEN, MAX_MENTIONS, extractSentIds,
+  pushText, sendTextReplyPreferred,
 } from '../line-api'
 
 describe('splitText', () => {
@@ -491,5 +492,88 @@ describe('DisplayNameCache', () => {
     expect(cache.get(UID_A)).toBe(UID_A)
     expect(cache.get(UID_B)).toBeNull()
     expect(cache.get(UID_C)).toBe(UID_C)
+  })
+})
+
+describe('extractSentIds', () => {
+  test('returns ids in the order LINE listed them', () => {
+    const body = JSON.stringify({ sentMessages: [{ id: '1' }, { id: '2' }, { id: '3' }] })
+    expect(extractSentIds(body)).toEqual(['1', '2', '3'])
+  })
+
+  test('skips entries without a usable id', () => {
+    const body = JSON.stringify({ sentMessages: [{ id: '1' }, {}, { id: '' }, { id: 7 }] })
+    expect(extractSentIds(body)).toEqual(['1'])
+  })
+
+  test('returns empty for a body without sentMessages', () => {
+    expect(extractSentIds('{}')).toEqual([])
+  })
+
+  test('returns empty rather than throwing on malformed JSON', () => {
+    expect(extractSentIds('not json')).toEqual([])
+  })
+
+  test('SentIdSet still records from the same body', () => {
+    const set = new SentIdSet()
+    set.recordFromResponseText(JSON.stringify({ sentMessages: [{ id: 'a' }, { id: 'b' }] }))
+    expect(set.has('a')).toBe(true)
+    expect(set.has('b')).toBe(true)
+  })
+})
+
+describe('sent-message records', () => {
+  const realFetch = globalThis.fetch
+
+  /** Stub LINE, answering each POST with one id per message in the request. */
+  function stubLine(idPrefix: string): { bodies: any[] } {
+    const bodies: any[] = []
+    globalThis.fetch = (async (_url: any, init: any) => {
+      const body = JSON.parse(init.body)
+      bodies.push(body)
+      const sentMessages = body.messages.map((_m: unknown, i: number) => ({
+        id: idPrefix + (bodies.length - 1) + '-' + i,
+      }))
+      return new Response(JSON.stringify({ sentMessages }), { status: 200 })
+    }) as typeof fetch
+    return { bodies }
+  }
+
+  afterEach(() => { globalThis.fetch = realFetch })
+
+  test('pushText pairs every returned id with the chunk it carried', async () => {
+    stubLine('p')
+    const sent = await pushText('C1', 'AAAA\n\nBBBB', 'tok', { chunkLimit: 5, chunkMode: 'newline' })
+    expect(sent).toEqual([
+      { id: 'p0-0', type: 'text', text: 'AAAA' },
+      { id: 'p0-1', type: 'text', text: 'BBBB' },
+    ])
+  })
+
+  test('reply path reports the ids it just sent', async () => {
+    stubLine('r')
+    const tokens = new ReplyTokenCache()
+    tokens.store('C1', 'reply-token')
+    const r = await sendTextReplyPreferred('C1', '晚安', 'tok', {
+      chunkLimit: 5000, chunkMode: 'newline', replyTokens: tokens,
+    })
+    expect(r.method).toBe('reply')
+    expect(r.sent).toEqual([{ id: 'r0-0', type: 'text', text: '晚安' }])
+  })
+
+  test('a send with no reply token falls back to push and still reports ids', async () => {
+    stubLine('f')
+    const r = await sendTextReplyPreferred('C1', '哈囉', 'tok', {
+      chunkLimit: 5000, chunkMode: 'newline',
+    })
+    expect(r.method).toBe('push')
+    expect(r.sent.map(s => s.id)).toEqual(['f0-0'])
+  })
+
+  test('ids also land in SentIdSet, so quote-replies still resolve', async () => {
+    stubLine('s')
+    const set = new SentIdSet()
+    await pushText('C1', 'hi', 'tok', { chunkLimit: 5000, chunkMode: 'newline', sentIds: set })
+    expect(set.has('s0-0')).toBe(true)
   })
 })
