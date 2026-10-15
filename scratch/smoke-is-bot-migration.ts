@@ -3,7 +3,7 @@
  * 數十萬列的真實資料上跑得完，而且既有列都落在 is_bot = 0。
  *
  * 用法：先把 messages.db（含 -wal/-shm）複製到別處，再把副本路徑傳進來。
- * 絕對不要指向 C:\Users\ATone\.claude\channels\line 底下的正本。
+ * 絕對不要指向 <LINE_STATE_DIR>（預設 ~/.claude/channels/line）底下的正本。
  */
 import { openDatabase, fetchMessages, recentChatIds } from '../db'
 
