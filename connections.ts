@@ -16,6 +16,7 @@ import type { GatewayToPlugin } from './protocol'
 
 export interface ConnectionData {
   cc_session_id: string
+  client_kind?: 'claude' | 'codex'
   pid: number
   plugin_version: string
   connected_at: number

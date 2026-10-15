@@ -92,13 +92,17 @@ interface LineWebhookPayload {
 
 // ISO-8601 with explicit Asia/Taipei +08:00 offset — consistent with
 // claude-line-channel so history.log and gateway DB read the same.
+// Built once: constructing a time-zoned Intl.DateTimeFormat per call keeps
+// its ICU state alive past GC and grows the process by hundreds of MB.
+const TAIPEI_FORMAT = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Taipei',
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+  fractionalSecondDigits: 3, hour12: false,
+})
+
 function toTaipeiISOString(date: Date): string {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Taipei',
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    fractionalSecondDigits: 3, hour12: false,
-  }).formatToParts(date)
+  const parts = TAIPEI_FORMAT.formatToParts(date)
   const get = (type: string) => parts.find(p => p.type === type)?.value ?? '00'
   return `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}.${get('fractionalSecond')}+08:00`
 }
@@ -176,7 +180,7 @@ export function dispatch(
 
     const frame: InboundFrame = { type: 'inbound', event: ev }
     const enrichment = buildEnrichment(ev, deps)
-    if (enrichment) frame.enrichment = enrichment
+    frame.enrichment = { ...enrichment, received_at: receivedAt }
     const sent = deps.registry.send(handler, frame)
     if (sent) result.routed_to_handler++
     else result.dropped_no_handler++
@@ -195,16 +199,17 @@ function chatIdOf(ev: LineMessageEvent): string | null {
  * Build the inbound-frame enrichment: only populated when the event has
  * `message.quotedMessageId` and we have a way to resolve it. Two
  * signals, strongest first:
- *   - `quoted_is_bot_sent` — the id is in SentIdSet (we sent it via
- *     this gateway instance), so it's definitely a reply to the bot
- *   - `quoted_absent_from_archive` — the id is not in our inbound
- *     archive; with archive being a user-only log, absence is a
- *     reasonable proxy for "must be a bot message". Weaker signal
- *     because the archive is bounded by when gateway started
+ *   - `quoted_is_bot_sent` — we sent that message: either it is still
+ *     in SentIdSet (this gateway process sent it) or the archive has it
+ *     flagged as ours, which survives a restart the in-memory set does
+ *     not
+ *   - `quoted_absent_from_archive` — the id is in neither direction of
+ *     the archive at all, so it predates what we store. Weakest signal,
+ *     kept because the archive only reaches back to when it started
  */
-function buildEnrichment(
+export function buildEnrichment(
   ev: LineMessageEvent,
-  deps: WebhookDeps,
+  deps: Pick<WebhookDeps, 'db' | 'sentIds' | 'displayNames'>,
 ): InboundFrame['enrichment'] | undefined {
   const enr: NonNullable<InboundFrame['enrichment']> = {}
 
@@ -217,6 +222,9 @@ function buildEnrichment(
     if (deps.db) {
       const row = getMessageById(deps.db, quoted)
       enr.quoted_absent_from_archive = row === null
+      // Archived bot rows outlive SentIdSet, which a restart empties —
+      // without this, quoting the bot stops reading as a mention.
+      if (row?.is_bot) enr.quoted_is_bot_sent = true
       if (row) {
         if (row.sender_user_id) enr.quoted_user = row.sender_user_id
         if (row.received_at)    enr.quoted_ts   = row.received_at

@@ -380,3 +380,25 @@ describe('formatInbound user_name wiring', () => {
     expect(n?.meta.user_name).toBeUndefined()
   })
 })
+
+describe('quoted_is_bot_sent', () => {
+  const quoteEvent = {
+    type: 'message',
+    source: { type: 'user' as const, userId: 'U1' },
+    message: { id: 'm1', type: 'text', text: '這句你說的吧', quotedMessageId: 'm0' },
+  }
+
+  test('surfaces as the string "true" so the channel tag keeps the flag', () => {
+    const n = formatInbound(quoteEvent, {
+      enrichment: { quoted_message_id: 'm0', quoted_is_bot_sent: true },
+    })
+    expect(n!.meta.quoted_is_bot_sent).toBe('true')
+  })
+
+  test('stays absent when the quoted message came from someone else', () => {
+    const n = formatInbound(quoteEvent, {
+      enrichment: { quoted_message_id: 'm0', quoted_user: 'Uwang' },
+    })
+    expect(n!.meta.quoted_is_bot_sent).toBeUndefined()
+  })
+})

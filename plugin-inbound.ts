@@ -35,6 +35,14 @@ export interface ChannelMeta {
   quoted_type?: string
   quoted_text?: string
   /**
+   * `"true"` when the quoted message is one we sent — the sender is
+   * replying to us, not to another member. Absent otherwise; there is no
+   * `"false"` to read, so treat absence as "someone else's message".
+   *
+   * A string, like every other meta value here — see quoted_image_set.
+   */
+  quoted_is_bot_sent?: string
+  /**
    * Present when the quoted message was one image of a multi-image LINE
    * "album" share, rendered as `"<index>/<total>"` (e.g. `"2/5"`) — a total
    * above 1 is the signal there are more images than this one to look at.
@@ -97,13 +105,17 @@ export function replaceEmojiPlaceholders(
   return result
 }
 
+// Built once: constructing a time-zoned Intl.DateTimeFormat per call keeps
+// its ICU state alive past GC and grows the process by hundreds of MB.
+const TAIPEI_FORMAT = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Taipei',
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+  fractionalSecondDigits: 3, hour12: false,
+})
+
 function toTaipeiISOString(date: Date): string {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Taipei',
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    fractionalSecondDigits: 3, hour12: false,
-  }).formatToParts(date)
+  const parts = TAIPEI_FORMAT.formatToParts(date)
   const get = (type: string) => parts.find(p => p.type === type)?.value ?? '00'
   return `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}.${get('fractionalSecond')}+08:00`
 }
@@ -173,6 +185,7 @@ export function formatInbound(
   const enr = deps.enrichment
   if (enr?.quoted_message_id) {
     meta.quoted_message_id = enr.quoted_message_id
+    if (enr.quoted_is_bot_sent) meta.quoted_is_bot_sent = 'true'
     if (enr.quoted_user) meta.quoted_user = enr.quoted_user
     if (enr.quoted_ts)   meta.quoted_ts   = enr.quoted_ts
     if (enr.quoted_type) meta.quoted_type = enr.quoted_type

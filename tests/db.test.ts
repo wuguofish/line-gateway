@@ -4,9 +4,9 @@ import { unlinkSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
-  openDatabase, insertMessage, fetchMessages,
+  openDatabase, insertMessage, insertBotMessage, fetchMessages,
   recentChatIds, countMessages, extractChatId, getQuoteToken,
-  getImageSetMessages,
+  getImageSetMessages, getMessageById,
   type InboundMessageEvent,
 } from '../db'
 
@@ -105,6 +105,21 @@ describe('insertMessage + fetchMessages', () => {
     insertMessage(db, makeEvent({ id: 'b' }), '2026-04-17T11:00:00.000+08:00')
     const rows = fetchMessages(db, { since: '2026-04-17T10:30:00.000+08:00' })
     expect(rows.map(r => r.id)).toEqual(['b'])
+  })
+
+  test('oldest-first composite cursor paginates equal timestamps without gaps', () => {
+    const ts = '2026-04-17T10:00:00.000+08:00'
+    for (const id of ['a', 'b', 'c']) insertMessage(db, makeEvent({ id }), ts)
+
+    const first = fetchMessages(db, { since: ts, after_id: '', order: 'asc', limit: 2 })
+    expect(first.map((row) => row.id)).toEqual(['a', 'b'])
+    const second = fetchMessages(db, {
+      since: first[1]!.received_at,
+      after_id: first[1]!.id,
+      order: 'asc',
+      limit: 2,
+    })
+    expect(second.map((row) => row.id)).toEqual(['c'])
   })
 
   test('recentChatIds returns DISTINCT chat ids after cutoff', () => {
@@ -264,5 +279,54 @@ describe('getQuoteToken', () => {
   test('returns null when the archived message has no quoteToken', () => {
     insertMessage(db, makeEvent({ id: 'm1' }), '2026-04-17T10:00:00.000+08:00')
     expect(getQuoteToken(db, 'm1')).toBeNull()
+  })
+})
+
+describe('insertBotMessage', () => {
+  let db: Database
+  const SENT_AT = '2026-09-14T12:00:00.000+08:00'
+  beforeEach(() => {
+    db = openDatabase(':memory:')
+    insertBotMessage(db, { id: 'bot-1', chat_id: 'C1', message_type: 'text', text: '我在' },
+      SENT_AT, 1757822400000)
+  })
+
+  test('archives the message flagged as ours', () => {
+    const row = getMessageById(db, 'bot-1')
+    expect(row!.is_bot).toBe(1)
+    expect(row!.text).toBe('我在')
+    expect(row!.chat_id).toBe('C1')
+    expect(row!.sender_user_id).toBeNull()
+  })
+
+  test('inbound messages stay flagged as not ours', () => {
+    insertMessage(db, makeEvent({ id: 'in-1' }), SENT_AT)
+    expect(getMessageById(db, 'in-1')!.is_bot).toBe(0)
+  })
+
+  test('fetchMessages hides our own messages by default', () => {
+    insertMessage(db, makeEvent({ id: 'in-1' }), SENT_AT)
+    expect(fetchMessages(db).map(r => r.id)).toEqual(['in-1'])
+  })
+
+  test('include_bot returns them alongside inbound', () => {
+    insertMessage(db, makeEvent({ id: 'in-1' }), SENT_AT)
+    const ids = fetchMessages(db, { include_bot: true }).map(r => r.id).sort()
+    expect(ids).toEqual(['bot-1', 'in-1'])
+  })
+
+  test('our own message does not open the send_image window on its own', () => {
+    expect(recentChatIds(db, '2026-09-14T00:00:00.000+08:00')).toEqual([])
+  })
+
+  test('a human message does open it', () => {
+    insertMessage(db, makeEvent({ id: 'in-1', chatType: 'group' }), SENT_AT)
+    expect(recentChatIds(db, '2026-09-14T00:00:00.000+08:00')).toEqual(['C1'])
+  })
+
+  test('resending the same LINE id is ignored', () => {
+    insertBotMessage(db, { id: 'bot-1', chat_id: 'C1', message_type: 'text', text: '改過的' },
+      SENT_AT, 1757822400000)
+    expect(getMessageById(db, 'bot-1')!.text).toBe('我在')
   })
 })

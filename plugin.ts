@@ -112,7 +112,7 @@ const TOOLS = [
   },
   {
     name: 'get_content',
-    description: 'Fetch binary content (image/file/video/audio) sent by a LINE user. Returns a direct LINE download URL plus metadata. If the message is one image of a multi-image "album" share (LINE imageSet — inbound meta shows quoted_image_set_total when a reply quotes one), this returns EVERY image in the set, not just the one requested — pass any single message_id from the set.',
+    description: 'Fetch the content of a LINE message by id. Binary (image/file/video/audio) is downloaded and saved, and images come back inline when small enough. A text message returns its text straight from the gateway archive — including text you sent yourself, so this is how you read back your own words when someone quotes them. If the message is one image of a multi-image "album" share (LINE imageSet — inbound meta shows quoted_image_set_total when a reply quotes one), this returns EVERY image in the set, not just the one requested — pass any single message_id from the set.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -162,13 +162,17 @@ const TOOLS = [
   },
   {
     name: 'fetch_messages',
-    description: 'Return recent inbound LINE messages persisted by the gateway. Useful across restarts when webhook history is otherwise lost.',
+    description: 'Return recent LINE messages persisted by the gateway. Useful across restarts when webhook history is otherwise lost. Inbound only unless include_bot is set.',
     inputSchema: {
       type: 'object',
       properties: {
         chat_id: { type: 'string', description: 'Filter to a single chat' },
         limit:   { type: 'number', description: 'Max rows (default 50, cap 500)' },
         since:   { type: 'string', description: 'ISO-8601 cutoff; only rows received after this ts' },
+        include_bot: {
+          type: 'boolean',
+          description: 'Also return messages you sent (is_bot 1) — use this to look up what you already said in a chat. Default false.',
+        },
       },
     },
   },
@@ -253,6 +257,13 @@ export function createPlugin(opts: PluginOptions): PluginHandle {
         // if so, image_set.message_ids lists every member (ordered).
         const probe = await client.apiRequest('get_content', { message_id }) as {
           image_set?: { id: string; total?: number; message_ids: string[] }
+          text?: string
+        }
+        // Text messages come back from the gateway's archive with no
+        // binary to download — hand the words over directly instead of
+        // writing a .txt to the inbox and pointing at it.
+        if (typeof probe.text === 'string') {
+          return { content: [{ type: 'text', text: probe.text }] }
         }
         const filename = typeof args.filename === 'string' ? args.filename : undefined
         const setIds = probe.image_set?.message_ids

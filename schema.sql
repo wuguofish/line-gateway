@@ -5,6 +5,11 @@
 -- `fetch_messages` MCP tool work across plugin restarts, the gateway
 -- persists every inbound message to SQLite as it arrives.
 --
+-- Messages the bot itself sends are archived here too, flagged with
+-- is_bot = 1, so a session that lost its scrollback can look up what it
+-- already said. Readers that mean "what did people say to us" must
+-- filter on is_bot = 0 — see fetchMessages/recentChatIds in db.ts.
+--
 -- Using LINE's message id as the primary key makes duplicate webhook
 -- deliveries (LINE retries on 5xx) idempotent without extra bookkeeping.
 
@@ -19,7 +24,8 @@ CREATE TABLE IF NOT EXISTS messages (
     raw_json        TEXT NOT NULL,           -- full event JSON for future decoding
     image_set_id    TEXT,                    -- message.imageSet.id when sent as a multi-image album
     image_set_index INTEGER,                 -- 1-based position within the set
-    image_set_total INTEGER                  -- total images in the set
+    image_set_total INTEGER,                 -- total images in the set
+    is_bot          INTEGER NOT NULL DEFAULT 0 -- 1 = sent by the bot, 0 = inbound webhook
 );
 -- image_set_id/index/total on a fresh table are covered by the CREATE
 -- above; db.ts additionally runs an idempotent ALTER TABLE migration for
