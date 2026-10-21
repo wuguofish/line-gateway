@@ -15,11 +15,17 @@ port contention. Gateway hoists the webhook out of the plugin.
 ## Architecture (short)
 
 - **Gateway** (`main.ts` → `gateway.ts`): single `Bun.serve` on loopback
-  port 3456. Routes `/webhook` (POST → LINE event parsing, persistence,
-  push to handler), `/ws` (WebSocket upgrade for plugins), `/healthz`.
-- **Plugin** (not yet written): stdio MCP server spawned per Claude
-  Code session. Opens WSS to Gateway. MCP tools (`reply`/`push`/...)
-  forward to Gateway as `api_request` frames.
+  port 3456. Routes `/webhook` (POST → signature check, persistence,
+  push to handler), `/ws` (WebSocket upgrade for plugins), `/content`,
+  `/upload`, `/static`, `/emoji` and `/healthz`. Only `/webhook` is
+  authenticated; the rest rely on the loopback bind.
+- **Plugin** (`plugin-main.ts` → `plugin.ts`): stdio MCP server named
+  `line`, spawned per Claude Code session. Opens a WebSocket to the
+  Gateway. Its tools (`reply`, `reply_all`, `get_content`, `get_emoji`,
+  `send_image`, `upload_file`, `fetch_messages`, `claim_handler`,
+  `release_handler`) forward to the Gateway as `api_request` frames;
+  inbound messages that pass `access.json` reach Claude as
+  `notifications/claude/channel`.
 - **Handler** (`handler.ts`): the one session currently designated to
   receive LINE inbound messages. Others can still push, but do not
   receive inject. Grace period on disconnect before forfeiture.
@@ -32,11 +38,26 @@ port contention. Gateway hoists the webhook out of the plugin.
 
 ```
 main.ts                  daemon entry
-gateway.ts               Bun.serve HTTP + WS
+gateway.ts               Bun.serve HTTP + WS, api_request dispatch
+webhook.ts               signature check, event routing, permission-reply interception
+line-api.ts              LINE Messaging API client
+db.ts, schema.sql        SQLite message archive
+uploads.ts               /upload and /static image store
+permissions.ts           permission request id -> originating session
+access.ts                owner lookup (allowFrom[0]) for the gateway
+env.ts                   state dir, .env, credentials
 connections.ts           cc_session_id -> ServerWebSocket
 handler.ts               claim / release / grace-period state
 protocol.ts              WSS frame types (source of truth)
-tests/                   bun:test unit suites (pure logic only)
+plugin-main.ts           plugin entry (stdio MCP)
+plugin.ts                MCP server: tools, channel notifications, permission relay
+plugin-access.ts         access.json gate
+plugin-inbound.ts        inbound event -> channel notification
+plugin-get-content.ts    get_content download and inline images
+plugin-canned-reply.ts   one-time reply to senders not on the allowlist
+gateway-client.ts        plugin-side WebSocket client (reconnect, claim)
+install-task.ps1         Windows logon task that runs start-daemon.ps1
+tests/                   bun:test suites (network mocked; a few write to tmpdir)
 scratch/                 manual smoke scripts (bun:test + WebSocket
                          client currently hangs — integration runs here)
 ```
@@ -49,8 +70,7 @@ scratch/smoke-ws.ts exercises the full round-trip. If a future bun
 release fixes this, migrate `scratch/smoke-ws.ts` to
 `tests/gateway.test.ts` with the existing helper.
 
-## Commits
+## Repository
 
-Kept in the repo root (not `mcp-servers/`-level) — line-gateway stands
-on its own, same as `../switchboard/`. No remote yet; init + push when
-Phase A is wrapping up.
+Remote: `https://github.com/wuguofish/line-gateway`. README.md is the
+user-facing guide (setup, configuration, tools, limitations).
