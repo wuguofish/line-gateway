@@ -17,8 +17,9 @@ port contention. Gateway hoists the webhook out of the plugin.
 - **Gateway** (`main.ts` → `gateway.ts`): single `Bun.serve` on loopback
   port 3456. Routes `/webhook` (POST → signature check, persistence,
   push to handler), `/ws` (WebSocket upgrade for plugins), `/content`,
-  `/upload`, `/static`, `/emoji` and `/healthz`. Only `/webhook` is
-  authenticated; the rest rely on the loopback bind.
+  `/upload`, `/static`, `/emoji`, `/peer/*` and `/healthz`. Only
+  `/webhook` and the signed `/peer/inbox` and `/peer/sessions` check the
+  caller; the rest rely on the loopback bind.
 - **Plugin** (`plugin-main.ts` → `plugin.ts`): stdio MCP server named
   `line`, spawned per Claude Code session. Opens a WebSocket to the
   Gateway. Its tools (`reply`, `reply_all`, `get_content`, `get_emoji`,
@@ -29,6 +30,9 @@ port contention. Gateway hoists the webhook out of the plugin.
 - **Handler** (`handler.ts`): the one session currently designated to
   receive LINE inbound messages. Others can still push, but do not
   receive inject. Grace period on disconnect before forfeiture.
+- **Cross-machine peers** (`peers.ts`, `peer-routes.ts`): carries
+  Switchboard `send("<peer>:<alias>")` to another machine's gateway over
+  the tunnel with a signed envelope; README has the peers.json shape.
 - **Permission relay**: LINE permission-request `y <id>` / `n <id>`
   replies are intercepted by Gateway and routed back only to the
   originating plugin via `permission_reply` frames (not to the handler
@@ -46,6 +50,8 @@ uploads.ts               /upload and /static image store
 permissions.ts           permission request id -> originating session
 access.ts                owner lookup (allowFrom[0]) for the gateway
 env.ts                   state dir, .env, credentials
+peers.ts                 cross-machine peer config, signing, replay guard
+peer-routes.ts           /peer/send (loopback), /peer/inbox and /peer/sessions handlers
 connections.ts           cc_session_id -> ServerWebSocket
 handler.ts               claim / release / grace-period state
 protocol.ts              WSS frame types (source of truth)

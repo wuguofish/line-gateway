@@ -16,6 +16,7 @@ import { parseFrame, type PluginToGateway, type GatewayToPlugin } from './protoc
 import { PermissionRouter } from './permissions'
 import { verifySignature, dispatch, buildEnrichment } from './webhook'
 import { readAccess } from './access'
+import { createPeerRoutes, DEFAULT_SWITCHBOARD_URL } from './peer-routes'
 import type { LineConfig } from './env'
 import {
   openDatabase, fetchMessages, recentChatIds, getMessageById, getQuoteToken,
@@ -53,6 +54,13 @@ export interface GatewayOptions {
   dbPath?: string
   /** `send_image` allow-window — chat must have inbound within this ms. */
   sendImageAllowWindowMs?: number
+  /**
+   * Cross-machine peer transport (see peers.ts). Defaults to
+   * `<stateDir>/peers.json` and the local Switchboard on 9876; a missing
+   * peers.json leaves both /peer routes answering "not configured".
+   */
+  peersFile?: string
+  switchboardUrl?: string
 }
 
 export interface GatewayHandle {
@@ -116,6 +124,11 @@ export function startGateway(opts: GatewayOptions): GatewayHandle {
   const db = openDatabase(dbPath)
 
   const sendImageWindowMs = opts.sendImageAllowWindowMs ?? DEFAULT_SEND_IMAGE_ALLOW_WINDOW_MS
+
+  const peerRoutes = createPeerRoutes({
+    peersFile: opts.peersFile ?? (lineConfig ? join(lineConfig.stateDir, 'peers.json') : 'peers.json'),
+    switchboardUrl: opts.switchboardUrl ?? process.env.SWITCHBOARD_URL ?? DEFAULT_SWITCHBOARD_URL,
+  })
 
   const send = (ws: ServerWebSocket<ConnectionData>, frame: GatewayToPlugin): void => {
     try {
@@ -296,6 +309,13 @@ export function startGateway(opts: GatewayOptions): GatewayHandle {
           }
         })()
       }
+
+      // Cross-machine peer transport. /peer/send is for the local
+      // Switchboard (tunnelled requests are refused inside the handler);
+      // /peer/inbox is the public, signed entry point for peer gateways.
+      if (url.pathname === '/peer/send') return peerRoutes.handleSend(req)
+      if (url.pathname === '/peer/inbox') return peerRoutes.handleInbox(req)
+      if (url.pathname === '/peer/sessions') return peerRoutes.handleSessions(req)
 
       if (url.pathname === '/healthz') {
         return Response.json({

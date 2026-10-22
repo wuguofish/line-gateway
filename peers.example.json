@@ -1,0 +1,9 @@
+{
+  "self": "office",
+  "peers": {
+    "home": {
+      "url": "https://line-home.example.com",
+      "secret": "replace-with-a-long-random-shared-secret"
+    }
+  }
+}

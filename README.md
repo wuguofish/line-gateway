@@ -5,7 +5,10 @@ machine can share. A single Bun daemon owns the webhook and talks to LINE;
 each Claude Code session runs a small stdio MCP plugin that connects to the
 daemon over WebSocket. Every session can send to LINE, and one session at a
 time — the *handler* — receives inbound messages as Claude Code
-[channel](https://code.claude.com/docs/en/channels) events.
+[channel](https://code.claude.com/docs/en/channels) events. Two machines
+that each run a gateway can also carry
+[Switchboard](https://github.com/wuguofish/Switchboard) messages to each
+other (see [Cross-machine peers](#cross-machine-peers)).
 
 ```
 LINE platform ──HTTPS tunnel──▶ gateway daemon ◀──WebSocket── plugin (stdio MCP) ── Claude Code session
@@ -67,8 +70,10 @@ LINE platform ──HTTPS tunnel──▶ gateway daemon ◀──WebSocket─�
 5. Point the tunnel at `http://127.0.0.1:3456` and set the channel's webhook
    URL in the LINE Developers console to `https://<your host>/webhook`.
    Expose only `/webhook` and `/static/` (plus `/healthz` if you want an
-   external health check). The other routes have no authentication and rely
-   on the loopback bind, so keep them off the tunnel.
+   external health check, and `/peer/inbox` and `/peer/sessions` if you use
+   [cross-machine peers](#cross-machine-peers)). The other routes have no
+   authentication and rely on the loopback bind, so keep them off the
+   tunnel.
 
 6. Register the plugin with Claude Code, for example in the `mcpServers` of
    your settings:
@@ -104,6 +109,7 @@ Daemon:
 | `LINE_CHANNEL_ACCESS_TOKEN` | none | LINE API token. Without the token and the secret, `/webhook` answers 503 and sending fails |
 | `LINE_CHANNEL_SECRET` | none | Verifies the `x-line-signature` header on `/webhook` |
 | `LINE_GATEWAY_PUBLIC_URL` | none | Public origin of the tunnel; `send_image(file_path)` builds the image URL that LINE fetches from it |
+| `SWITCHBOARD_URL` | `http://127.0.0.1:9876` | Local Switchboard that receives messages from peer machines |
 
 Plugin:
 
@@ -115,8 +121,8 @@ Plugin:
 | `CLAUDE_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID` | none | The session identity the daemon tracks the handler by. Without either, the plugin connects as `anon-<pid>` and a restart cannot reclaim the seat |
 
 The state dir also holds `messages.db` (the message archive), `uploads/`
-(images for `send_image`, deleted after 24 hours), `inbox/` and a few
-`*.log` files.
+(images for `send_image`, deleted after 24 hours), `inbox/`, a few `*.log`
+files and, if you use it, `peers.json`.
 
 ## Access control
 
@@ -178,14 +184,72 @@ and a request expires after 10 minutes.
   during the 30-second grace period, are archived but not delivered, and
   LINE is not asked to retry. A session that reclaims its seat gets a notice
   about the gap; `fetch_messages` reads what it missed.
-- Only `/webhook` is authenticated. `/ws`, `/upload`, `/content` and `/emoji`
+- Only `/webhook` and the signed `/peer/inbox` and `/peer/sessions` check
+  who is calling. `/ws`, `/upload`, `/content`, `/emoji` and `/peer/send`
   must stay off the tunnel.
 - `send_image` only works for chats that had a human message in the last 24
   hours, and it is always sent as a push message.
 - `upload_file` sends the file to a third-party host, gofile.io.
 - Timestamps use a fixed `+08:00` offset.
-- The cross-machine Switchboard relay (`send` to `<peer>:<alias>`) is not
-  part of this public version.
+
+## Cross-machine peers
+
+Two machines that each run line-gateway behind a public tunnel can pass
+Switchboard messages to each other. When the Switchboard on machine A is
+asked to `send` to `home:<alias>` and has no local session by that name, it
+hands the message to its gateway (`SWITCHBOARD_PEER_RELAY_URL`, default
+`http://127.0.0.1:3456`). The gateway signs it and POSTs it to machine B's
+gateway, which gives it to B's Switchboard as a message from
+`office:<sender>` and wakes the session like any other mail.
+
+```
+Switchboard A ─loopback─▶ gateway A ─tunnel─▶ gateway B ─loopback─▶ Switchboard B
+   send("home:x")       POST /peer/send     POST /peer/inbox     POST /external/send
+```
+
+Write `<state dir>/peers.json` on both machines; `peers.example.json` has
+the shape. It holds the shared secret, so make it readable only by your
+account.
+
+```json
+{
+  "self": "office",
+  "peers": {
+    "home": { "url": "https://line-home.example.com", "secret": "<shared secret, 16+ characters>" }
+  }
+}
+```
+
+- `self` is how this machine names itself; the other side shows it as the
+  sender prefix. Machine B's file mirrors this one, with `"self": "home"` and
+  an `office` entry. Peer names are short lowercase words (`[a-z0-9_-]`).
+- Each pair of machines shares one secret. Requests are signed with
+  HMAC-SHA256 over `<timestamp>.<body>`, must arrive within 5 minutes, and
+  each envelope id is accepted once, so a captured request cannot be
+  replayed.
+- `POST /peer/inbox` is the public entry point: the gateway verifies the
+  request, then forwards it to the local Switchboard at `SWITCHBOARD_URL`.
+- `GET /peer/sessions` answers a signed request from a peer with this
+  machine's online Switchboard sessions. From loopback, `?peer=<name>` asks
+  that peer instead; Switchboard's `list_sessions(peer)` uses this and
+  returns aliases as `<peer>:<alias>`, ready for `send`.
+- `POST /peer/send` is only for the local Switchboard.
+- The file is read again on every request, so adding a peer needs no
+  restart. Without the file, the `/peer` routes refuse every request.
+- Nothing is queued: when a peer is unreachable, the sender gets the error.
+
+**Tunnel:** open `/peer/inbox` and `/peer/sessions`, and keep `/peer/send`
+off the tunnel. The gateway also refuses `/peer/send` when a request carries
+cloudflared's `cf-connecting-ip` header or a `Host` that is not a loopback
+address. A proxy that rewrites `Host` to localhost gets past both checks,
+though, so the tunnel's path allowlist is what really protects it.
+
+End-to-end check on one machine, with two gateways and a Switchboard on
+temporary ports 13460–13462:
+
+```sh
+SWITCHBOARD_REPO=/path/to/Switchboard bun scratch/smoke-peer.ts
+```
 
 ## Development
 

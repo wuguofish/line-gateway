@@ -18,6 +18,7 @@ process.stderr.write(`line-gateway:   state dir: ${lineConfig.stateDir}\n`)
 process.stderr.write(`line-gateway:   /ws       WebSocket for session plugins\n`)
 process.stderr.write(`line-gateway:   /webhook  LINE webhook inbound\n`)
 process.stderr.write(`line-gateway:   /healthz  liveness probe\n`)
+process.stderr.write(`line-gateway:   /peer/*   cross-machine Switchboard transport (peers.json)\n`)
 
 const shutdown = async (): Promise<void> => {
   process.stderr.write('line-gateway: shutting down\n')
