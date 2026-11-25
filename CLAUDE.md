@@ -64,17 +64,15 @@ plugin-canned-reply.ts   one-time reply to senders not on the allowlist
 gateway-client.ts        plugin-side WebSocket client (reconnect, claim)
 install-task.ps1         Windows logon task that runs start-daemon.ps1
 tests/                   bun:test suites (network mocked; a few write to tmpdir)
-scratch/                 manual smoke scripts (bun:test + WebSocket
-                         client currently hangs — integration runs here)
+scratch/                 manual smoke scripts (integration checks run here)
 ```
 
-## bun:test WebSocket hang
+## bun:test WebSocket
 
-`new WebSocket()` inside a `test(...)` body currently hangs `bun test`
-(tested on bun 1.3.11). The daemon works fine under `bun main.ts` —
-scratch/smoke-ws.ts exercises the full round-trip. If a future bun
-release fixes this, migrate `scratch/smoke-ws.ts` to
-`tests/gateway.test.ts` with the existing helper.
+`new WebSocket()` inside a `test(...)` body hangs `bun test` on bun
+1.3.11 and works on bun 1.4.5 (a `startGateway` round-trip of hello,
+claim, ping and fetch_messages passes). The integration checks in
+`scratch/smoke-ws.ts` can move to `tests/gateway.test.ts`.
 
 ## Repository
 
